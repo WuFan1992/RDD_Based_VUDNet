@@ -13,6 +13,18 @@ from torch.utils.data import Dataset
 import cv2
 from .utils import scale_intrinsics, warp_depth, warp_points2d
 
+
+
+def fix_path_from_d2net(path):
+    if not path:
+        return None
+
+    path = path.replace('Undistorted_SfM/', '')
+    path = path.replace('images', 'dense0/imgs')
+    path = path.replace('phoenix/S6/zl548/MegaDepth_v1/', '')
+
+    return path
+
 class MegaDepthDataset(Dataset):
     def __init__(
             self,
@@ -42,6 +54,14 @@ class MegaDepthDataset(Dataset):
             self.pair_infos = [self.pair_infos[idx] for idx in indices]
         self.transforms = transforms.Compose([transforms.ToPILImage(),
                                                   transforms.ToTensor()])
+        
+        
+        # 兼容 D2 Net 的路径格式
+        for idx in range(len(self.scene_info['image_paths'])):
+            self.scene_info['image_paths'][idx] = fix_path_from_d2net(self.scene_info['image_paths'][idx])
+
+        for idx in range(len(self.scene_info['depth_paths'])):
+            self.scene_info['depth_paths'][idx] = fix_path_from_d2net(self.scene_info['depth_paths'][idx])
             
     def __len__(self):
         return len(self.pair_infos)
@@ -52,6 +72,7 @@ class MegaDepthDataset(Dataset):
         img_name0 = self.scene_info['image_paths'][idx0]
         img_name1 = self.scene_info['image_paths'][idx1]
 
+        """
         depth0_rel = '/'.join([
             self.scene_info['depth_paths'][idx0]
             .replace('phoenix/S6/zl548/MegaDepth_v1', 'depth_undistorted')
@@ -62,7 +83,12 @@ class MegaDepthDataset(Dataset):
             .replace('phoenix/S6/zl548/MegaDepth_v1', 'depth_undistorted')
             .split('/')[i] for i in [0, 1, -1]
         ])
-
+        """
+        
+        depth0_rel = self.scene_info['depth_paths'][idx0]
+        depth1_rel = self.scene_info['depth_paths'][idx1]
+        
+        
         depth_path0 = self.data_path / depth0_rel
         with h5py.File(depth_path0, 'r') as hdf5_file:
             depth0 = np.array(hdf5_file['/depth'])

@@ -10,3 +10,6 @@ outputs
 **.so
 data/*
 !data/.gitkeep
+ckpt_descriptor/*
+datasets/*
+third_party/*

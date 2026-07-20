@@ -28,11 +28,11 @@ class ResampleDataCallback(pl.Callback):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Lightning-based RDD training pipeline.")
 
-    parser.add_argument('--megadepth_root_path', type=Path, default=Path('./data/megadepth'),
+    parser.add_argument('--megadepth_root_path', type=Path, default=Path('./datasets'),
                         help='Path to the MegaDepth dataset root directory.')
-    parser.add_argument('--test_data_root', type=Path, default=Path('./data/megadepth_test_1500'),
+    parser.add_argument('--test_data_root', type=Path, default=Path('./datasets/megadepth_test_1500'),
                         help='Path to the MegaDepth test dataset root directory.')
-    parser.add_argument('--val_indices_root', type=Path, default=Path('megadepth_indices/scene_info_val_1500'),
+    parser.add_argument('--val_indices_root', type=Path, default=Path('train_data/megadepth_indices/scene_info_val_1500'),
                         help='Path (relative to MegaDepth root) to validation index files.')
     parser.add_argument('--aerial_train_dataset', type=str, default='air_ground',
                         choices=['air_ground', 'aerial_megadepth', 'none'],

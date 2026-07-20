@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import glob
 import random
+from functools import partial
 from pathlib import Path
 from typing import Optional
 
@@ -86,8 +87,14 @@ class CombinedDataModule(pl.LightningDataModule):
 
     # Training / validation datasets -------------------------------------------------
     def _build_train_dataset(self) -> ConcatDataset:
-        indices_root = self.megadepth_root / 'megadepth_indices' / 'scene_info_0.1_0.7'
-        npz_paths = self._load_train_npz_paths(indices_root)
+        indices_root = self.megadepth_root / 'train_data' /'megadepth_indices' / 'scene_info_0.1_0.7'
+
+        #############################################
+        #npz_paths = self._load_train_npz_paths(indices_root)
+        #############################################
+        # 这里只使用 0022 scene 的数据集
+        npz_paths = list(indices_root.glob("*.npz"))
+        print("npz_paths: ", npz_paths)
 
         if self.train_detector:
             min_overlap, max_overlap = 0.1, 0.8
@@ -97,9 +104,10 @@ class CombinedDataModule(pl.LightningDataModule):
             num_per_scene = 200
 
         def build_split(mode: str) -> ConcatDataset:
+            root = str(self.megadepth_root) + '/MegaDepth_v1'
             datasets = [
                 MegaDepthDataset(
-                    root=self.megadepth_root,
+                    root=root,
                     npz_path=path,
                     min_overlap_score=min_overlap,
                     max_overlap_score=max_overlap,
@@ -111,7 +119,6 @@ class CombinedDataModule(pl.LightningDataModule):
                 for path in npz_paths
             ]
             return ConcatDataset(datasets)
-
         datasets = [build_split(mode) for mode in self._train_modes()]
         if self.aerial_train_dataset == "air_ground":
             self._append_air_ground_datasets(datasets, num_per_scene, min_overlap, max_overlap)
@@ -220,7 +227,7 @@ class CombinedDataModule(pl.LightningDataModule):
         train_list_path = self.megadepth_root / 'megadepth_indices' / 'trainvaltest_list' / 'train_list.txt'
         if not train_list_path.exists():
             raise FileNotFoundError(f"MegaDepth train list not found: {train_list_path}")
-
+        
         npz_paths: list[str] = []
         missing_entries: list[str] = []
         seen_paths: set[str] = set()
@@ -250,7 +257,7 @@ class CombinedDataModule(pl.LightningDataModule):
             )
         if not npz_paths:
             raise FileNotFoundError(f"No MegaDepth training indices found from {train_list_path}")
-
+        
         return npz_paths
 
     def _build_val_dataset(self) -> Optional[ConcatDataset]:
@@ -262,9 +269,10 @@ class CombinedDataModule(pl.LightningDataModule):
         if not npz_paths:
             raise FileNotFoundError(f"No MegaDepth validation indices found under {val_root}")
 
+        root = str(self.megadepth_root) + '/MegaDepth_v1'
         datasets = [
             MegaDepthDataset(
-                root=self.megadepth_root,
+                root = root,
                 npz_path=path,
                 min_overlap_score=0.0,
                 max_overlap_score=1.0,
@@ -281,6 +289,7 @@ class CombinedDataModule(pl.LightningDataModule):
     def train_dataloader(self) -> DataLoader:
         self._ensure_train_dataset()
         assert self.train_dataset is not None, "setup() must be called before requesting dataloaders."
+        worker_init_fn = partial(_seed_worker, base_seed=self.seed)
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
@@ -288,18 +297,19 @@ class CombinedDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=True,
             persistent_workers=self.num_workers > 0,
-            worker_init_fn=lambda worker_id: _seed_worker(worker_id, self.seed),
+            worker_init_fn=worker_init_fn,
         )
 
     def val_dataloader(self) -> Optional[DataLoader]:
         if self.val_dataset is None:
             return []
+        worker_init_fn = partial(_seed_worker, base_seed=self.seed)
         loader = DataLoader(
             self.val_dataset,
             batch_size=1,
             shuffle=False,
             num_workers=min(self.num_workers, 4),
             pin_memory=True,
-            worker_init_fn=lambda worker_id: _seed_worker(worker_id, self.seed),
+            worker_init_fn=worker_init_fn,
         )
         return loader
