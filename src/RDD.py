@@ -1,0 +1,312 @@
+# Description: RDD model
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+import numpy as np
+from .utils import NestedTensor, nested_tensor_from_tensor_list, to_pixel_coords, lower_config
+from .models.detector import build_detector
+from .models.descriptor import build_descriptor
+from .models.soft_detect import SoftDetect
+from .models.interpolator import InterpolateSparse2d
+from .config.default import get_cfg_defaults
+
+class RDD(nn.Module):
+
+    def __init__(self, detector, descriptor, detection_threshold=0.5, top_k=4096):
+        super().__init__()
+        self.detector = detector
+        self.descriptor = descriptor
+        self.interpolator = InterpolateSparse2d('bicubic')
+        self.detection_threshold = detection_threshold
+        self.top_k = top_k
+        self.register_buffer('_device_ref', torch.empty(0), persistent=False)
+        self.softdetect = None
+        self.stride = descriptor.stride
+
+    @property
+    def device(self) -> torch.device:
+        return self._device_ref.device
+
+    def to(self, *args, **kwargs):  # type: ignore[override]
+        result = super().to(*args, **kwargs)
+        if result.softdetect is not None:
+            result.softdetect = result.softdetect.to(result.device)
+        return result
+
+    def train(self, mode=True):
+        super().train(mode)
+        
+    def eval(self):
+        self.set_softdetect(self.top_k, self.detection_threshold)
+        super().eval()
+        
+    def forward(self, samples: NestedTensor, detector_only: bool = False):
+        
+        if not isinstance(samples, NestedTensor):
+            samples = nested_tensor_from_tensor_list(samples)
+
+        if getattr(self.detector, 'uses_descriptor_features', False):
+            feats, matchibility = self.descriptor(samples)
+            scoremap = self.detector(feats, samples.tensors.shape[-2:])
+            if detector_only:
+                return scoremap
+            return feats, scoremap, matchibility
+
+        scoremap = self.detector(samples)
+        
+        if detector_only:
+            return scoremap
+
+        feats, matchibility = self.descriptor(samples)
+        
+        return feats, scoremap, matchibility
+    
+    def set_softdetect(self, top_k=4096, scores_th=0.01):
+        self.softdetect = SoftDetect(radius=2, top_k=top_k, scores_th=scores_th).to(self.device)
+    
+    @torch.inference_mode()
+    def filter(self, matchibility):
+        # Filter out keypoints on the border
+        B, _, H, W = matchibility.shape
+        frame = torch.zeros(B, H, W, device=matchibility.device)
+        frame[:, self.stride:-self.stride, self.stride:-self.stride] = 1
+        matchibility = matchibility * frame
+        return matchibility
+    
+    @torch.inference_mode()
+    def extract(self, x):
+        if self.softdetect is None:
+            self.set_softdetect(top_k=self.top_k, scores_th=self.detection_threshold)
+        
+        x, rh1, rw1 = self.preprocess_tensor(x)
+        x = x.to(self.device).float()
+        B, _, _H1, _W1 = x.shape
+        M1, K1, H1 = self.forward(x)
+        M1 = F.normalize(M1, dim=1)
+        
+        keypoints, kptscores, scoredispersitys = self.softdetect(K1, normalized_coordinates=False)
+        
+        keypoints = torch.vstack([keypoints[b].unsqueeze(0) for b in range(B)])
+        kptscores = torch.vstack([kptscores[b].unsqueeze(0) for b in range(B)])
+        
+        feats = self.interpolator(M1, keypoints, H = _H1, W = _W1)
+        
+        feats = F.normalize(feats, dim=-1)
+		
+        # Correct kpt scale
+        keypoints = keypoints * torch.tensor([rw1,rh1], device=keypoints.device).view(1, -1)
+
+        return [  
+                    {'keypoints': keypoints[b],
+                    'scores': kptscores[b],
+                    'descriptors': feats[b]} for b in range(B) 
+                ]	
+        
+    @torch.inference_mode()
+    def extract_3rd_party(self, x, model='aliked'):
+        """
+        one image per batch
+        """
+        x, rh1, rw1 = self.preprocess_tensor(x)
+        B, _, _H1, _W1 = x.shape
+        if model == 'aliked':
+            from third_party import extract_aliked_kpts
+            img = x
+            mkpts, scores = extract_aliked_kpts(img, self.device)
+        else:
+            raise ValueError('Unknown model')
+    
+        M1, _ = self.descriptor(x)
+        M1 = F.normalize(M1, dim=1)
+        
+        if mkpts.shape[1] > self.top_k:
+            idx = torch.argsort(scores, descending=True)[0][:self.top_k]
+            mkpts = mkpts[:,idx]
+            scores = scores[:,idx]
+
+        feats = self.interpolator(M1, mkpts, H = _H1, W = _W1)
+        feats = F.normalize(feats, dim=-1)
+        mkpts = mkpts * torch.tensor([rw1,rh1], device=mkpts.device).view(1, 1, -1)
+        
+        return [  
+				   {'keypoints': mkpts[b],
+                    'scores': scores[b],
+					'descriptors': feats[b]} for b in range(B) 
+			   ]
+        
+    @torch.inference_mode()
+    def extract_dense(self, x, n_limit=30000, thr=0.01):
+        
+        img_size = x.shape[-2:]
+        
+        x, rh1, rw1 = self.preprocess_tensor(x)
+
+        B, _, _H1, _W1 = x.shape
+
+        M1, K1, H1 = self.forward(x)
+        M1 = F.normalize(M1, dim=1)
+        
+        keypoints, kptscores, scoredispersitys = self.softdetect(K1, normalized_coordinates=False)
+        
+        keypoints = torch.vstack([keypoints[b].unsqueeze(0) for b in range(B)])
+        kptscores = torch.vstack([kptscores[b].unsqueeze(0) for b in range(B)])
+        
+        feats = self.interpolator(M1, keypoints, H = _H1, W = _W1)
+        
+        feats = F.normalize(feats, dim=-1)
+        
+        H1 = self.filter(H1)
+        
+        dense_kpts, dense_scores, inds = self.sample_dense_kpts(H1, n_limit=n_limit)
+ 
+        dense_keypoints = to_pixel_coords(dense_kpts, _H1, _W1)
+
+        dense_feats = self.interpolator(M1, dense_keypoints, H = _H1, W = _W1)
+        
+        dense_feats = F.normalize(dense_feats, dim=-1)
+        
+        keypoints = keypoints * torch.tensor([rw1,rh1], device=keypoints.device).view(1, -1)
+        dense_keypoints = dense_keypoints * torch.tensor([rw1,rh1], device=dense_keypoints.device).view(1, -1)	
+
+        valid_dense = dense_scores > thr		
+
+        return [  
+                    {'keypoints': keypoints[b],
+                    'scores': kptscores[b],
+                    'descriptors': feats[b], 
+                    'keypoints_dense': dense_keypoints[b][valid_dense[b]],
+                    'scores_dense': dense_scores[b][valid_dense[b]],
+                    'descriptors_dense': dense_feats[b][valid_dense[b]],
+                    'image_size': img_size,
+                    } for b in range(B)
+                ]
+        
+    @torch.inference_mode()
+    def sample_dense_kpts(self, keypoint_logits, threshold=0.01, n_limit=30000, force_kpts = True):
+        
+        B, K, H, W = keypoint_logits.shape
+
+        if n_limit < 0 or n_limit > H*W:
+            n_limit = min(H*W - 1, n_limit)
+
+        scoremap = keypoint_logits.permute(0,2,3,1)
+
+        scoremap = scoremap.reshape(B, H, W)
+
+        frame = torch.zeros(B, H, W, device=keypoint_logits.device)
+
+        frame[:, 1:-1, 1:-1] = 1
+
+        scoremap = scoremap * frame
+
+        scoremap = scoremap.reshape(B, H*W)
+
+        grid = self.get_grid(B, H, W, device = keypoint_logits.device)
+
+        inds = torch.topk(scoremap, n_limit, dim=1).indices
+
+        # inds = torch.multinomial(scoremap, top_k, replacement=False)
+        kpts = torch.gather(grid, 1, inds[..., None].expand(B, n_limit, 2))
+        scoremap = torch.gather(scoremap, 1, inds)
+        if force_kpts:
+            valid = scoremap > threshold
+            kpts = kpts[valid][None]
+            scoremap = scoremap[valid][None]
+
+        return kpts, scoremap, inds
+
+    def preprocess_tensor(self, x):
+        """ Guarantee that image is divisible by 32 to avoid aliasing artifacts. """
+        if isinstance(x, np.ndarray) and len(x.shape) == 3:
+            x = torch.tensor(x).permute(2,0,1)[None]
+        x = x.to(self.device).float()
+
+        H, W = x.shape[-2:]
+
+        _H, _W = (H//32) * 32, (W//32) * 32
+
+        rh, rw = H/_H, W/_W
+
+        x = F.interpolate(x, (_H, _W), mode='bilinear', align_corners=False)
+        return x, rh, rw
+
+    @torch.inference_mode()
+    def get_grid(self, B, H, W, device = None):
+        x1_n = torch.meshgrid(
+        *[
+            torch.linspace(
+                -1 + 1 / n, 1 - 1 / n, n, device=device
+            )
+            for n in (B, H, W)
+        ]
+        )
+        x1_n = torch.stack((x1_n[2], x1_n[1]), dim=-1).reshape(B, H * W, 2)
+        return x1_n
+
+def _lower_mapping(config):
+    if isinstance(config, dict):
+        return {k.lower(): _lower_mapping(v) for k, v in config.items()}
+    return lower_config(config)
+
+
+def _resolve_build_config(config=None, config_file=None):
+    if config is not None and config_file is not None:
+        raise ValueError("Pass either 'config' or 'config_file', not both.")
+
+    if config_file is not None:
+        config = config_file
+
+    if config is None:
+        default_cfg = get_cfg_defaults()
+        return lower_config(default_cfg)['rdd']
+
+    if isinstance(config, (str, Path)):
+        cfg = get_cfg_defaults()
+        cfg.merge_from_file(str(config))
+        return lower_config(cfg)['rdd']
+
+    config = _lower_mapping(config)
+    if isinstance(config, dict) and 'rdd' in config and 'descriptor' not in config:
+        return config['rdd']
+    return config
+
+
+def build(config=None, weights=None, config_file=None):
+    """Build an RDD model from defaults, a config dict, or a YAML config file."""
+    checkpoint = None
+    if weights is not None:
+        checkpoint = torch.load(weights, map_location='cpu')
+        if config is None and config_file is None and isinstance(checkpoint, dict):
+            hyper_parameters = checkpoint.get('hyper_parameters', {})
+            checkpoint_config = hyper_parameters.get('model_config')
+            if checkpoint_config is not None:
+                config = checkpoint_config
+
+    config = _resolve_build_config(config=config, config_file=config_file)
+
+    descriptor = build_descriptor(config['descriptor'])
+    detector_config = dict(config['detector'])
+    if detector_config.get('type', 'legacy') == 'shared_descriptor':
+        detector_config.setdefault('input_dim', descriptor.hidden_dim)
+    detector = build_detector(detector_config)
+    model = RDD(
+        detector, 
+        descriptor, 
+        detection_threshold=config['detection_thr'], 
+        top_k=config['top_k']
+    )
+
+    if checkpoint is not None:
+        state = checkpoint
+        if isinstance(state, dict):
+            if 'model' in state:
+                state = state['model']
+            elif 'state_dict' in state:
+                state = state['state_dict']
+                # if keys start with model. remove it
+                if list(state.keys())[0].startswith('model.'):
+                    state = {k[len('model.'):]: v for k, v in state.items()}
+        model.load_state_dict(state, strict=True)
+    return model
