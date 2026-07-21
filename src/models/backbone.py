@@ -7,6 +7,12 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 from torchvision.models import ResNet50_Weights, resnet50
 from torchvision.models._utils import IntermediateLayerGetter
+
+try:
+    from torchvision.models import mobilenet_v2, MobileNet_V2_Weights
+except ImportError:  # pragma: no cover - older torchvision compat
+    from torchvision.models import mobilenet_v2
+    MobileNet_V2_Weights = None
 from .convnext import (
     convnext_base,
     convnext_large,
@@ -24,6 +30,7 @@ MODEL_TO_NUM_CHANNELS: Dict[str, list[int]] = {
     "convnext_large": [192, 384, 768, 1536],
     "convnext_xlarge": [256, 512, 1024, 2048],
     "resnet50": [256, 512, 1024, 2048],
+    "mobilenet_v2": [32, 24, 32, 96, 320],
 }
 CONVNEXT_BUILDERS = {
     "convnext_tiny": convnext_tiny,
@@ -46,6 +53,8 @@ def _canonical_backbone_name(backbone_name: str) -> str:
     normalized = backbone_name.lower().replace("-", "_")
     if normalized == "resnet_50":
         return "resnet50"
+    if normalized in {"mobilenet", "mobilenet_v2"}:
+        return "mobilenet_v2"
     return normalized
 
 
@@ -150,6 +159,36 @@ class ResNetFeatureExtractor(nn.Module):
                 )
             outputs[name] = NestedTensor(feat, mask_i)
         return outputs
+
+
+class MobileNetFeatureExtractor(nn.Module):
+    """Expose MobileNetV2 feature maps at 1/2, 1/4, 1/8, 1/16 and 1/32 resolutions."""
+
+    def __init__(self, model: nn.Module, backbone_name: str) -> None:
+        super().__init__()
+        self.model = model.features
+        self.strides = [2, 4, 8, 16, 32]
+        self.num_channels = MODEL_TO_NUM_CHANNELS[backbone_name]
+        self.stage1 = self.model[0]
+        self.stage2 = nn.Sequential(*[self.model[i] for i in range(1, 4)])
+        self.stage3 = nn.Sequential(*[self.model[i] for i in range(4, 7)])
+        self.stage4 = nn.Sequential(*[self.model[i] for i in range(7, 14)])
+        self.stage5 = nn.Sequential(*[self.model[i] for i in range(14, 18)])
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor]) -> Dict[str, NestedTensor]:
+        outputs: Dict[str, NestedTensor] = {}
+        stages = [self.stage1, self.stage2, self.stage3, self.stage4, self.stage5]
+        feat = x
+        for idx, stage in enumerate(stages):
+            feat = stage(feat)
+            mask_i = None
+            if mask is not None:
+                mask_i = (
+                    F.interpolate(mask[None].float(), size=feat.shape[-2:], mode="nearest")
+                    .to(torch.bool)[0]
+                )
+            outputs[str(idx)] = NestedTensor(feat, mask_i)
+        return outputs
     
 class Backbone(nn.Module):
     def __init__(self, config, pretrain: bool = False, **_: Any) -> None:
@@ -173,6 +212,13 @@ class Backbone(nn.Module):
                 backbone_name,
                 config.get("num_feature_levels", 5),
             )
+        elif backbone_name == "mobilenet_v2":
+            if MobileNet_V2_Weights is not None:
+                weights = MobileNet_V2_Weights.DEFAULT if pretrain else None
+                model = mobilenet_v2(weights=weights)
+            else:
+                model = mobilenet_v2(pretrained=pretrain)
+            self.encoder = MobileNetFeatureExtractor(model, backbone_name)
         else:
             raise ValueError(f"Unsupported backbone '{config['backbone']}'.")
         self.strides = self.encoder.strides
