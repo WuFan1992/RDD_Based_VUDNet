@@ -162,24 +162,25 @@ class ResNetFeatureExtractor(nn.Module):
 
 
 class MobileNetFeatureExtractor(nn.Module):
-    """Expose MobileNetV2 feature maps at 1/2, 1/4, 1/8, 1/16 and 1/32 resolutions."""
+    """Expose MobileNetV2 feature maps at 1/2, 1/4, 1/8 and 1/16 resolutions."""
 
-    def __init__(self, model: nn.Module, backbone_name: str) -> None:
+    def __init__(self, model: nn.Module, backbone_name: str, num_feature_levels: int) -> None:
         super().__init__()
         self.model = model.features
-        self.strides = [2, 4, 8, 16, 32]
-        self.num_channels = MODEL_TO_NUM_CHANNELS[backbone_name]
+        self.num_feature_levels = min(max(num_feature_levels, 1), 4)
+        self.strides = [2, 4, 8, 16][: self.num_feature_levels]
+        self.num_channels = MODEL_TO_NUM_CHANNELS[backbone_name][: self.num_feature_levels]
         self.stage1 = self.model[0]
         self.stage2 = nn.Sequential(*[self.model[i] for i in range(1, 4)])
         self.stage3 = nn.Sequential(*[self.model[i] for i in range(4, 7)])
         self.stage4 = nn.Sequential(*[self.model[i] for i in range(7, 14)])
         self.stage5 = nn.Sequential(*[self.model[i] for i in range(14, 18)])
+        self.stages = [self.stage1, self.stage2, self.stage3, self.stage4][: self.num_feature_levels]
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor]) -> Dict[str, NestedTensor]:
         outputs: Dict[str, NestedTensor] = {}
-        stages = [self.stage1, self.stage2, self.stage3, self.stage4, self.stage5]
         feat = x
-        for idx, stage in enumerate(stages):
+        for idx, stage in enumerate(self.stages):
             feat = stage(feat)
             mask_i = None
             if mask is not None:
@@ -195,6 +196,9 @@ class Backbone(nn.Module):
         super().__init__()
         backbone_name = _canonical_backbone_name(config["backbone"])
         use_22k = config.get("use_22k", True)
+        num_feature_levels = config.get("num_feature_levels", 5)
+        if backbone_name == "mobilenet_v2" and num_feature_levels > 4:
+            num_feature_levels = 4
         if backbone_name in CONVNEXT_BUILDERS:
             builder = CONVNEXT_BUILDERS[backbone_name]
             model = builder(pretrained=pretrain, in_22k=use_22k)
@@ -210,7 +214,7 @@ class Backbone(nn.Module):
             self.encoder = ResNetFeatureExtractor(
                 model,
                 backbone_name,
-                config.get("num_feature_levels", 5),
+                num_feature_levels,
             )
         elif backbone_name == "mobilenet_v2":
             if MobileNet_V2_Weights is not None:
@@ -218,7 +222,7 @@ class Backbone(nn.Module):
                 model = mobilenet_v2(weights=weights)
             else:
                 model = mobilenet_v2(pretrained=pretrain)
-            self.encoder = MobileNetFeatureExtractor(model, backbone_name)
+            self.encoder = MobileNetFeatureExtractor(model, backbone_name, num_feature_levels)
         else:
             raise ValueError(f"Unsupported backbone '{config['backbone']}'.")
         self.strides = self.encoder.strides
