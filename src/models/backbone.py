@@ -9,10 +9,16 @@ from torchvision.models import ResNet50_Weights, resnet50
 from torchvision.models._utils import IntermediateLayerGetter
 
 try:
-    from torchvision.models import mobilenet_v2, MobileNet_V2_Weights
+    from torchvision.models import (
+        mobilenet_v2,
+        MobileNet_V2_Weights,
+        mobilenet_v3_large,
+        MobileNet_V3_Large_Weights,
+    )
 except ImportError:  # pragma: no cover - older torchvision compat
-    from torchvision.models import mobilenet_v2
+    from torchvision.models import mobilenet_v2, mobilenet_v3_large
     MobileNet_V2_Weights = None
+    MobileNet_V3_Large_Weights = None
 from .convnext import (
     convnext_base,
     convnext_large,
@@ -31,6 +37,7 @@ MODEL_TO_NUM_CHANNELS: Dict[str, list[int]] = {
     "convnext_xlarge": [256, 512, 1024, 2048],
     "resnet50": [256, 512, 1024, 2048],
     "mobilenet_v2": [32, 24, 32, 96, 320],
+    "mobilenet_v3_large": [16, 24, 40, 80, 160],
 }
 CONVNEXT_BUILDERS = {
     "convnext_tiny": convnext_tiny,
@@ -55,6 +62,8 @@ def _canonical_backbone_name(backbone_name: str) -> str:
         return "resnet50"
     if normalized in {"mobilenet", "mobilenet_v2"}:
         return "mobilenet_v2"
+    if normalized in {"mobilenet_v3", "mobilenet_v3_large"}:
+        return "mobilenet_v3_large"
     return normalized
 
 
@@ -162,7 +171,7 @@ class ResNetFeatureExtractor(nn.Module):
 
 
 class MobileNetFeatureExtractor(nn.Module):
-    """Expose MobileNetV2 feature maps at 1/2, 1/4, 1/8 and 1/16 resolutions."""
+    """Expose MobileNet feature maps at 1/2, 1/4, 1/8 and 1/16 resolutions."""
 
     def __init__(self, model: nn.Module, backbone_name: str, num_feature_levels: int) -> None:
         super().__init__()
@@ -170,11 +179,20 @@ class MobileNetFeatureExtractor(nn.Module):
         self.num_feature_levels = min(max(num_feature_levels, 1), 4)
         self.strides = [2, 4, 8, 16][: self.num_feature_levels]
         self.num_channels = MODEL_TO_NUM_CHANNELS[backbone_name][: self.num_feature_levels]
-        self.stage1 = self.model[0]
-        self.stage2 = nn.Sequential(*[self.model[i] for i in range(1, 4)])
-        self.stage3 = nn.Sequential(*[self.model[i] for i in range(4, 7)])
-        self.stage4 = nn.Sequential(*[self.model[i] for i in range(7, 14)])
-        self.stage5 = nn.Sequential(*[self.model[i] for i in range(14, 18)])
+
+        if backbone_name == "mobilenet_v3_large":
+            self.stage1 = self.model[0]
+            self.stage2 = nn.Sequential(*[self.model[i] for i in range(1, 4)])
+            self.stage3 = nn.Sequential(*[self.model[i] for i in range(4, 7)])
+            self.stage4 = nn.Sequential(*[self.model[i] for i in range(7, 11)])
+            self.stage5 = nn.Sequential(*[self.model[i] for i in range(11, 16)])
+        else:
+            self.stage1 = self.model[0]
+            self.stage2 = nn.Sequential(*[self.model[i] for i in range(1, 4)])
+            self.stage3 = nn.Sequential(*[self.model[i] for i in range(4, 7)])
+            self.stage4 = nn.Sequential(*[self.model[i] for i in range(7, 14)])
+            self.stage5 = nn.Sequential(*[self.model[i] for i in range(14, 18)])
+
         self.stages = [self.stage1, self.stage2, self.stage3, self.stage4][: self.num_feature_levels]
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor]) -> Dict[str, NestedTensor]:
@@ -197,7 +215,7 @@ class Backbone(nn.Module):
         backbone_name = _canonical_backbone_name(config["backbone"])
         use_22k = config.get("use_22k", True)
         num_feature_levels = config.get("num_feature_levels", 5)
-        if backbone_name == "mobilenet_v2" and num_feature_levels > 4:
+        if backbone_name in {"mobilenet_v2", "mobilenet_v3_large"} and num_feature_levels > 4:
             num_feature_levels = 4
         if backbone_name in CONVNEXT_BUILDERS:
             builder = CONVNEXT_BUILDERS[backbone_name]
@@ -216,12 +234,19 @@ class Backbone(nn.Module):
                 backbone_name,
                 num_feature_levels,
             )
-        elif backbone_name == "mobilenet_v2":
-            if MobileNet_V2_Weights is not None:
-                weights = MobileNet_V2_Weights.DEFAULT if pretrain else None
-                model = mobilenet_v2(weights=weights)
+        elif backbone_name in {"mobilenet_v2", "mobilenet_v3_large"}:
+            if backbone_name == "mobilenet_v3_large":
+                if MobileNet_V3_Large_Weights is not None:
+                    weights = MobileNet_V3_Large_Weights.DEFAULT if pretrain else None
+                    model = mobilenet_v3_large(weights=weights)
+                else:
+                    model = mobilenet_v3_large(weights=None)
             else:
-                model = mobilenet_v2(pretrained=pretrain)
+                if MobileNet_V2_Weights is not None:
+                    weights = MobileNet_V2_Weights.DEFAULT if pretrain else None
+                    model = mobilenet_v2(weights=weights)
+                else:
+                    model = mobilenet_v2(pretrained=pretrain)
             self.encoder = MobileNetFeatureExtractor(model, backbone_name, num_feature_levels)
         else:
             raise ValueError(f"Unsupported backbone '{config['backbone']}'.")

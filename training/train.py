@@ -16,6 +16,11 @@ from src.config.default import get_cfg_defaults
 from src.utils.misc import lower_config
 
 
+"""
+python training/train.py --ckpt_save_path /checkpoints/ --megadepth_root_path /datasets/ --batch_size 1 
+"""
+
+
 class ResampleDataCallback(pl.Callback):
     """Increment datamodule seed and trigger resampling after each training epoch."""
 

@@ -1,6 +1,6 @@
 RDD:
   DESCRIPTOR:
-    BACKBONE: mobilenet_v2
+    BACKBONE: mobilenet_v3_large
     USE_22K: false
     USE_DEFORMABLE_TRANSFORMER: true
     NUM_FEATURE_LEVELS: 5
