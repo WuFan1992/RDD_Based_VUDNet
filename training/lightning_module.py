@@ -9,7 +9,7 @@ import pytorch_lightning as pl
 import torch
 import torch.distributed as dist
 from torch import optim
-from torch.optim.lr_scheduler import MultiStepLR
+from torch.optim.lr_scheduler import MultiStepLR, StepLR
 from collections import defaultdict
 import torch.nn.functional as F
 from src.RDD import build
@@ -105,7 +105,12 @@ class RDDLightningModule(pl.LightningModule):
     def configure_optimizers(self):
         params = filter(lambda p: p.requires_grad, self.model.parameters())
         optimizer = optim.AdamW(params, lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
-        scheduler = MultiStepLR(optimizer, milestones=self.hparams.milestones, gamma=self.hparams.gamma_steplr)
+        
+        ########## 这里是我修改的第二个地方#######################
+        #scheduler = MultiStepLR(optimizer, milestones=self.hparams.milestones, gamma=self.hparams.gamma_steplr)
+        scheduler = StepLR(optimizer, step_size=2000, gamma=self.hparams.gamma_steplr)
+        ###########################################################
+        
         return {
             "optimizer": optimizer,
             "lr_scheduler": {

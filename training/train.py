@@ -67,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay for AdamW.')
 
     parser.add_argument('--descriptor_epochs', type=int, default=20, help='Number of descriptor training epochs.')
-    parser.add_argument('--detector_epochs', type=int, default=5, help='Number of detector training epochs.')
+    parser.add_argument('--detector_epochs', type=int, default=20, help='Number of detector training epochs.')
 
     parser.add_argument('--seed', type=int, default=0, help='Random seed.')
     parser.add_argument('--accelerator', type=str, default='auto', help='Lightning accelerator (e.g. auto, gpu).')
@@ -82,7 +82,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--detector_from', type=Path, default=None,
                         help='Descriptor checkpoint used to initialise detector stage.')
 
-    parser.add_argument('--warmup_step', type=int, default=3000,
+    parser.add_argument('--warmup_step', type=int, default=0,
                         help='Number of warmup steps (scaled with batch size) for learning rate scheduler.')
 
     parser.add_argument('--train_detector', dest='train_detector', action='store_true',
@@ -206,6 +206,11 @@ def main() -> None:
     _scaling = true_batch_size / CANONICAL_BS
     true_lr = args.lr * _scaling
     warmup_step = math.floor(args.warmup_step / _scaling)
+    
+    ######## 这里是修改的第一个地方 ##############
+    true_lr = 1e-4
+    ######################################
+    
 
     if not args.train_detector:
         descriptor_module = RDDLightningModule(
