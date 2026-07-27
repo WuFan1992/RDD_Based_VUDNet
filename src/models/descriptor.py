@@ -77,9 +77,10 @@ class RDD_Descriptor(nn.Module):
         masks = []
         for l, feat in enumerate(features):
             src, mask = feat.decompose()
+            if mask is None:
+                mask = torch.zeros((src.shape[0], src.shape[-2], src.shape[-1]), dtype=torch.bool, device=src.device)
             srcs.append(self.input_proj[l](src))
             masks.append(mask)
-            assert mask is not None
         if self.num_feature_levels > len(srcs):
             _len_srcs = len(srcs)
             for l in range(_len_srcs, self.num_feature_levels):
@@ -88,6 +89,8 @@ class RDD_Descriptor(nn.Module):
                 else:
                     src = self.input_proj[l](srcs[-1])
                 m = samples.mask
+                if m is None:
+                    m = torch.zeros((src.shape[0], src.shape[-2], src.shape[-1]), dtype=torch.bool, device=src.device)
                 mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
                 pos_l = self.backbone[1](NestedTensor(src, mask)).to(src.dtype)
                 srcs.append(src)

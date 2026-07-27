@@ -37,7 +37,9 @@ MODEL_TO_NUM_CHANNELS: Dict[str, list[int]] = {
     "convnext_xlarge": [256, 512, 1024, 2048],
     "resnet50": [256, 512, 1024, 2048],
     "mobilenet_v2": [32, 24, 32, 96, 320],
-    "mobilenet_v3_large": [16, 24, 40, 80, 160],
+    # Keep MobileNet V3 feature strides aligned with ResNet: /4, /8, /16, /32.
+    # The descriptor adds a /64 level when NUM_FEATURE_LEVELS is 5.
+    "mobilenet_v3_large": [24, 40, 80, 160],
 }
 CONVNEXT_BUILDERS = {
     "convnext_tiny": convnext_tiny,
@@ -171,13 +173,13 @@ class ResNetFeatureExtractor(nn.Module):
 
 
 class MobileNetFeatureExtractor(nn.Module):
-    """Expose MobileNet feature maps at 1/2, 1/4, 1/8 and 1/16 resolutions."""
+    """Expose MobileNet feature maps at 1/4, 1/8, 1/16 and 1/32 resolutions."""
 
     def __init__(self, model: nn.Module, backbone_name: str, num_feature_levels: int) -> None:
         super().__init__()
         self.model = model.features
         self.num_feature_levels = min(max(num_feature_levels, 1), 4)
-        self.strides = [2, 4, 8, 16][: self.num_feature_levels]
+        self.strides = [4, 8, 16, 32][: self.num_feature_levels]
         self.num_channels = MODEL_TO_NUM_CHANNELS[backbone_name][: self.num_feature_levels]
 
         if backbone_name == "mobilenet_v3_large":
@@ -193,11 +195,14 @@ class MobileNetFeatureExtractor(nn.Module):
             self.stage4 = nn.Sequential(*[self.model[i] for i in range(7, 14)])
             self.stage5 = nn.Sequential(*[self.model[i] for i in range(14, 18)])
 
-        self.stages = [self.stage1, self.stage2, self.stage3, self.stage4][: self.num_feature_levels]
+        # Do not feed the /2 feature map to the deformable transformer.  Keeping
+        # /4--/32 matches ResNet-50's feature resolutions and avoids a 4x token
+        # increase from the first feature level alone.
+        self.stages = [self.stage2, self.stage3, self.stage4, self.stage5][: self.num_feature_levels]
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor]) -> Dict[str, NestedTensor]:
         outputs: Dict[str, NestedTensor] = {}
-        feat = x
+        feat = self.stage1(x)
         for idx, stage in enumerate(self.stages):
             feat = stage(feat)
             mask_i = None
