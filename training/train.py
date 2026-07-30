@@ -17,7 +17,11 @@ from src.utils.misc import lower_config
 
 
 """
-python training/train.py --ckpt_save_path /checkpoints/ --megadepth_root_path /datasets/ --batch_size 1 
+针对新的em 交替的训练方法，使用如下命令
+python -m training.train --ckpt_save_path checkpoints/ --megadepth_root_path datasets/ --batch_size 1 --alternating_training --alternating_descriptor_epochs 4 --alternating_detector_epochs 1 --alternating_cycles 5
+
+如果想用回原来的先训练descriptor 再训练detector 的方法，使用如下指令 
+python -m training.train --no-alternating_training
 """
 
 
@@ -93,6 +97,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--train_detector', dest='train_detector', action='store_true',
                         help='Enable detector training stage.')
     parser.set_defaults(train_detector=False)
+    parser.add_argument('--alternating_training', dest='alternating_training', action='store_true',
+                        default=True,
+                        help='Enable alternating descriptor/detector training (4 descriptor epochs then 1 detector epoch).')
+    parser.add_argument('--no-alternating_training', dest='alternating_training', action='store_false',
+                        help='Disable alternating training and use the original sequential stage training.')
+    parser.add_argument('--alternating_descriptor_epochs', type=int, default=4,
+                        help='Number of descriptor epochs per alternating block.')
+    parser.add_argument('--alternating_detector_epochs', type=int, default=1,
+                        help='Number of detector epochs per alternating block.')
+    parser.add_argument('--alternating_cycles', type=int, default=5,
+                        help='Number of alternating descriptor/detector cycles to run.')
 
     return parser.parse_args()
 
@@ -166,6 +181,139 @@ def load_model_config_from_checkpoint(checkpoint_path: Optional[Path]) -> Option
     return deepcopy(model_config)
 
 
+def load_model_weights(module: RDDLightningModule, checkpoint_path: Optional[Path]) -> None:
+    if checkpoint_path is None:
+        return
+
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    if not isinstance(checkpoint, dict):
+        return
+
+    state_dict = None
+    if 'model' in checkpoint:
+        state_dict = checkpoint['model']
+    elif 'state_dict' in checkpoint:
+        state_dict = checkpoint['state_dict']
+    elif checkpoint:
+        state_dict = checkpoint
+
+    if state_dict is None:
+        return
+
+    if isinstance(state_dict, dict):
+        if state_dict and next(iter(state_dict.keys())).startswith('model.'):
+            state_dict = {k[len('model.'):]: v for k, v in state_dict.items() if k.startswith('model.')}
+        module.model.load_state_dict(state_dict, strict=False)
+
+
+def save_model_weights(module: RDDLightningModule, checkpoint_path: Path) -> None:
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({'model': module.model.state_dict()}, checkpoint_path)
+
+
+def run_alternating_training(
+    args: argparse.Namespace,
+    model_config: dict,
+    trainer_kwargs: dict,
+    ckpt_root: Path,
+    true_lr: float,
+    warmup_step: int,
+) -> None:
+    descriptor_epochs = max(1, args.alternating_descriptor_epochs)
+    detector_epochs = max(1, args.alternating_detector_epochs)
+    alternating_cycles = max(1, args.alternating_cycles)
+
+    initial_resume_path = args.resume_descriptor or args.detector_from
+    resume_path: Optional[Path] = initial_resume_path
+
+    for cycle_idx in range(alternating_cycles):
+        cycle_name = f'cycle_{cycle_idx:02d}'
+
+        descriptor_dm = CombinedDataModule(
+            megadepth_root_path=args.megadepth_root_path,
+            val_indices_root=args.val_indices_root,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            training_res=args.training_res,
+            train_detector=False,
+            seed=args.seed,
+            no_crop=args.no_crop,
+            aerial_train_dataset=args.aerial_train_dataset,
+            air_ground_root=args.air_ground_root,
+            air_ground_npz_root=args.air_ground_npz_root,
+            aerial_megadepth_root=args.aerial_megadepth_root,
+            aerial_megadepth_npz_path=args.aerial_megadepth_npz_path,
+        )
+        descriptor_module = RDDLightningModule(
+            stage='descriptor',
+            lr=true_lr,
+            lr_step_size=args.lr_step_size,
+            milestones=args.milestones,
+            gamma_steplr=args.gamma_steplr,
+            weight_decay=args.weight_decay,
+            descriptor_weights=None,
+            test_data_root=args.test_data_root,
+            model_config=deepcopy(model_config),
+            warmup_step=warmup_step,
+        )
+        load_model_weights(descriptor_module, resume_path)
+        descriptor_logger, descriptor_checkpoint = build_stage_logger_and_checkpoint(ckpt_root, f'descriptor_{cycle_name}')
+        descriptor_trainer = pl.Trainer(
+            max_epochs=descriptor_epochs,
+            default_root_dir=descriptor_logger.log_dir,
+            callbacks=[descriptor_checkpoint, ResampleDataCallback()],
+            logger=descriptor_logger,
+            check_val_every_n_epoch=1,
+            **trainer_kwargs,
+        )
+        descriptor_trainer.fit(descriptor_module, datamodule=descriptor_dm)
+        descriptor_weights_path = ckpt_root / f'{cycle_name}_descriptor.ckpt'
+        save_model_weights(descriptor_module, descriptor_weights_path)
+        resume_path = descriptor_weights_path
+
+        detector_dm = CombinedDataModule(
+            megadepth_root_path=args.megadepth_root_path,
+            val_indices_root=args.val_indices_root,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            training_res=args.training_res,
+            train_detector=True,
+            seed=args.seed,
+            no_crop=args.no_crop,
+            aerial_train_dataset=args.aerial_train_dataset,
+            air_ground_root=args.air_ground_root,
+            air_ground_npz_root=args.air_ground_npz_root,
+            aerial_megadepth_root=args.aerial_megadepth_root,
+            aerial_megadepth_npz_path=args.aerial_megadepth_npz_path,
+        )
+        detector_module = RDDLightningModule(
+            stage='detector',
+            lr=true_lr,
+            lr_step_size=args.lr_step_size,
+            milestones=args.milestones,
+            gamma_steplr=args.gamma_steplr,
+            weight_decay=args.weight_decay,
+            descriptor_weights=resume_path,
+            test_data_root=args.test_data_root,
+            model_config=deepcopy(model_config),
+            warmup_step=warmup_step,
+        )
+        load_model_weights(detector_module, resume_path)
+        detector_logger, detector_checkpoint = build_stage_logger_and_checkpoint(ckpt_root, f'detector_{cycle_name}')
+        detector_trainer = pl.Trainer(
+            max_epochs=detector_epochs,
+            default_root_dir=detector_logger.log_dir,
+            callbacks=[detector_checkpoint, ResampleDataCallback()],
+            logger=detector_logger,
+            check_val_every_n_epoch=1,
+            **trainer_kwargs,
+        )
+        detector_trainer.fit(detector_module, datamodule=detector_dm)
+        detector_weights_path = ckpt_root / f'{cycle_name}_detector.ckpt'
+        save_model_weights(detector_module, detector_weights_path)
+        resume_path = detector_weights_path
+
+
 def resolve_model_config(args: argparse.Namespace) -> dict:
     cfg = get_cfg_defaults()
     if args.config is not None:
@@ -215,7 +363,10 @@ def main() -> None:
     ######## 这里是修改的第一个地方 ##############
     true_lr = 1e-4
     ######################################
-    
+
+    if args.alternating_training:
+        run_alternating_training(args, model_config, trainer_kwargs, ckpt_root, true_lr, warmup_step)
+        return
 
     if not args.train_detector:
         descriptor_module = RDDLightningModule(
@@ -306,8 +457,6 @@ def main() -> None:
             check_val_every_n_epoch=1,
             **trainer_kwargs,
         )
-        if not joint_training:
-            detector_trainer_kwargs["val_check_interval"] = 32000 // true_batch_size
         detector_trainer = pl.Trainer(**detector_trainer_kwargs)
         detector_trainer.fit(
             detector_module,
