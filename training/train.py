@@ -44,6 +44,23 @@ class ResampleDataCallback(pl.Callback):
             datamodule.increment_seed_and_resample()
 
 
+class RestoreOptimizerStateCallback(pl.Callback):
+    """Restore optimizer state after Lightning creates the new trainer optimizers."""
+
+    def __init__(self, state: Optional[dict]) -> None:
+        super().__init__()
+        self.state = state
+
+    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if self.state is None:
+            return
+
+        trainer.optimizers[0].load_state_dict(self.state['optimizer'])
+        scheduler = trainer.lr_scheduler_configs[0].scheduler
+        scheduler.load_state_dict(self.state['scheduler'])
+        pl_module.optimizer_steps = self.state['optimizer_steps']
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Lightning-based RDD training pipeline.")
 
@@ -228,9 +245,27 @@ def load_model_weights(module: RDDLightningModule, checkpoint_path: Optional[Pat
         module.model.load_state_dict(state_dict, strict=False)
 
 
-def save_model_weights(module: RDDLightningModule, checkpoint_path: Path) -> None:
+def load_training_state(checkpoint_path: Optional[Path]) -> Optional[dict]:
+    if checkpoint_path is None or not checkpoint_path.exists():
+        return None
+
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    if not isinstance(checkpoint, dict) or 'optimizer' not in checkpoint:
+        return None
+    return checkpoint
+
+
+def save_training_state(module: RDDLightningModule, trainer: pl.Trainer, checkpoint_path: Path) -> None:
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({'model': module.model.state_dict()}, checkpoint_path)
+    torch.save(
+        {
+            'model': module.model.state_dict(),
+            'optimizer': trainer.optimizers[0].state_dict(),
+            'scheduler': trainer.lr_scheduler_configs[0].scheduler.state_dict(),
+            'optimizer_steps': module.optimizer_steps,
+        },
+        checkpoint_path,
+    )
 
 
 def run_alternating_training(
@@ -248,7 +283,8 @@ def run_alternating_training(
     initial_resume_path = args.resume_descriptor or args.detector_from
     resume_path: Optional[Path] = initial_resume_path
     logger, checkpoint = build_training_logger_and_checkpoint(ckpt_root)
-    stage_weights_path = ckpt_root / '.alternating_stage_weights.ckpt'
+    descriptor_state_path = ckpt_root / '.alternating_descriptor_state.ckpt'
+    detector_state_path = ckpt_root / '.alternating_detector_state.ckpt'
 
     for cycle_idx in range(alternating_cycles):
         cycle_name = f'cycle_{cycle_idx:02d}'
@@ -279,20 +315,28 @@ def run_alternating_training(
             test_data_root=args.test_data_root,
             model_config=deepcopy(model_config),
             warmup_step=warmup_step,
+            descriptor_detector_weighting=args.descriptor_detector_weighting,
+            descriptor_detector_weight_alpha=args.descriptor_detector_weight_alpha,
         )
-        load_model_weights(descriptor_module, resume_path)
+        descriptor_resume_path = detector_state_path if detector_state_path.exists() else resume_path
+        descriptor_optimizer_state = load_training_state(descriptor_state_path)
+        load_model_weights(descriptor_module, descriptor_resume_path)
         set_checkpoint_stage(checkpoint, f'descriptor_{cycle_name}')
         descriptor_trainer = pl.Trainer(
             max_epochs=descriptor_epochs,
             default_root_dir=logger.log_dir,
-            callbacks=[checkpoint, ResampleDataCallback()],
+            callbacks=[
+                checkpoint,
+                ResampleDataCallback(),
+                RestoreOptimizerStateCallback(descriptor_optimizer_state),
+            ],
             logger=logger,
             check_val_every_n_epoch=1,
             **trainer_kwargs,
         )
         descriptor_trainer.fit(descriptor_module, datamodule=descriptor_dm)
-        save_model_weights(descriptor_module, stage_weights_path)
-        resume_path = stage_weights_path
+        save_training_state(descriptor_module, descriptor_trainer, descriptor_state_path)
+        resume_path = descriptor_state_path
 
         detector_dm = CombinedDataModule(
             megadepth_root_path=args.megadepth_root_path,
@@ -323,21 +367,27 @@ def run_alternating_training(
             descriptor_detector_weighting=args.descriptor_detector_weighting,
             descriptor_detector_weight_alpha=args.descriptor_detector_weight_alpha,
         )
-        load_model_weights(detector_module, resume_path)
+        detector_optimizer_state = load_training_state(detector_state_path)
+        load_model_weights(detector_module, descriptor_state_path)
         set_checkpoint_stage(checkpoint, f'detector_{cycle_name}')
         detector_trainer = pl.Trainer(
             max_epochs=detector_epochs,
             default_root_dir=logger.log_dir,
-            callbacks=[checkpoint, ResampleDataCallback()],
+            callbacks=[
+                checkpoint,
+                ResampleDataCallback(),
+                RestoreOptimizerStateCallback(detector_optimizer_state),
+            ],
             logger=logger,
             check_val_every_n_epoch=1,
             **trainer_kwargs,
         )
         detector_trainer.fit(detector_module, datamodule=detector_dm)
-        save_model_weights(detector_module, stage_weights_path)
-        resume_path = stage_weights_path
+        save_training_state(detector_module, detector_trainer, detector_state_path)
+        resume_path = detector_state_path
 
-    stage_weights_path.unlink(missing_ok=True)
+    descriptor_state_path.unlink(missing_ok=True)
+    detector_state_path.unlink(missing_ok=True)
 
 
 def resolve_model_config(args: argparse.Namespace) -> dict:

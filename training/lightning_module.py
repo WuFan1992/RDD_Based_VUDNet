@@ -108,6 +108,7 @@ class RDDLightningModule(pl.LightningModule):
         self.warper = warper if stage == "descriptor" or self.joint_training else None
         self.validation_helper: Optional[RDD_helper] = None
         self.n_vals_plot = 32
+        self.optimizer_steps = 0
 
     # Lightning hooks ---------------------------------------------------------------
     def configure_optimizers(self):
@@ -133,11 +134,11 @@ class RDDLightningModule(pl.LightningModule):
                     # plotting using the model's own detector for detector training
         # learning rate warm up
         warmup_step = self.hparams.warmup_step
-        if self.trainer.global_step < warmup_step:
+        if self.optimizer_steps < warmup_step:
             if self.hparams.warmup_type == 'linear':
                 base_lr = self.hparams.warmup_ratio * self.hparams.lr
                 lr = base_lr + \
-                    (self.trainer.global_step / warmup_step) * \
+                    (self.optimizer_steps / warmup_step) * \
                     abs(self.hparams.lr - base_lr)
                 for pg in optimizer.param_groups:
                     pg['lr'] = lr
@@ -149,6 +150,7 @@ class RDDLightningModule(pl.LightningModule):
         # update params
         optimizer.step(closure=optimizer_closure)
         optimizer.zero_grad()
+        self.optimizer_steps += 1
 
     # Training ----------------------------------------------------------------------
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
@@ -192,7 +194,11 @@ class RDDLightningModule(pl.LightningModule):
             m2 = feats1[idx, :, pts2[:, 1], pts2[:, 0]].permute(1, 0)
 
             detector_scores = None
-            if scores_map0 is not None and scores_map1 is not None:
+            if (
+                self.descriptor_loss.detector_weighting
+                and scores_map0 is not None
+                and scores_map1 is not None
+            ):
                 score0 = scores_map0[idx, 0, pts1[:, 1], pts1[:, 0]]
                 score1 = scores_map1[idx, 0, pts2[:, 1], pts2[:, 0]]
                 detector_scores = 0.5 * (score0 + score1)

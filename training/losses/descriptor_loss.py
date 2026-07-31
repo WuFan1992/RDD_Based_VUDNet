@@ -14,6 +14,9 @@ class DescriptorLoss(nn.Module):
         self.detector_weight_alpha = detector_weight_alpha
 
     def forward(self, m1, m2, h1, h2, pts1, pts2, detector_scores=None):
+        if not self.detector_weighting:
+            detector_scores = None
+
         loss_ds = dual_softmax_loss(
             m1,
             m2,
