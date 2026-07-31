@@ -17,8 +17,18 @@ from src.utils.misc import lower_config
 
 
 """
-针对新的em 交替的训练方法，使用如下命令
-python -m training.train --ckpt_save_path checkpoints/ --megadepth_root_path datasets/ --batch_size 1 --alternating_training --alternating_descriptor_epochs 4 --alternating_detector_epochs 1 --alternating_cycles 5
+默认已经开启该机制，直接按原来的交替训练命令即可：
+  python -m training.train --ckpt_save_path checkpoints/ --megadepth_root_path datasets/ --batch_size 1 
+         --alternating_training --alternating_descriptor_epochs 4 --alternating_detector_epochs 1 
+          --alternating_cycles 5
+
+如果你想手动调节权重强度：
+   python -m training.train --ckpt_save_path checkpoints/ --megadepth_root_path datasets/ --batch_size 1 
+          --alternating_training --alternating_descriptor_epochs 4 --alternating_detector_epochs 1 
+        --alternating_cycles 5 --descriptor_detector_weight_alpha 0.7
+
+如果想关闭这项机制：
+   python -m training.train ... --no-descriptor_detector_weighting
 
 如果想用回原来的先训练descriptor 再训练detector 的方法，使用如下指令 
 python -m training.train --no-alternating_training
@@ -108,6 +118,13 @@ def parse_args() -> argparse.Namespace:
                         help='Number of detector epochs per alternating block.')
     parser.add_argument('--alternating_cycles', type=int, default=5,
                         help='Number of alternating descriptor/detector cycles to run.')
+    parser.add_argument('--descriptor_detector_weighting', dest='descriptor_detector_weighting', action='store_true',
+                        default=True,
+                        help='Use detector scores to re-weight descriptor losses for GT matches.')
+    parser.add_argument('--no-descriptor_detector_weighting', dest='descriptor_detector_weighting', action='store_false',
+                        help='Disable detector-guided weighting for descriptor loss.')
+    parser.add_argument('--descriptor_detector_weight_alpha', type=float, default=0.5,
+                        help='Mixing coefficient for detector score vs descriptor similarity score in descriptor weighting.')
 
     return parser.parse_args()
 
@@ -151,19 +168,24 @@ def prepare_trainer_kwargs(args: argparse.Namespace) -> dict:
     return kwargs
 
 
-def build_stage_logger_and_checkpoint(ckpt_root: Path, stage: str) -> tuple[TensorBoardLogger, ModelCheckpoint]:
-    logger = TensorBoardLogger(str(ckpt_root), name=stage)
+def build_training_logger_and_checkpoint(ckpt_root: Path) -> tuple[TensorBoardLogger, ModelCheckpoint]:
+    logger = TensorBoardLogger(str(ckpt_root), name='training')
     checkpoint = ModelCheckpoint(
         dirpath=str(Path(logger.log_dir) / 'checkpoints'),
-        filename='rdd-{epoch:02d}-{auc@10:.3f}',
+        filename='rdd-{epoch:02d}-{step:08d}-{auc@10:.3f}',
         monitor='auc@10',
         mode='max',
         save_top_k=5,
-        save_last=True,
+        save_last=False,
         save_weights_only=False,
         verbose=True,
     )
     return logger, checkpoint
+
+
+def set_checkpoint_stage(checkpoint: ModelCheckpoint, stage: str) -> None:
+    """Include the training stage in names written by the shared callback."""
+    checkpoint.filename = f'{stage}-{{epoch:02d}}-{{step:08d}}-{{auc@10:.3f}}'
 
 
 def load_model_config_from_checkpoint(checkpoint_path: Optional[Path]) -> Optional[dict]:
@@ -225,6 +247,8 @@ def run_alternating_training(
 
     initial_resume_path = args.resume_descriptor or args.detector_from
     resume_path: Optional[Path] = initial_resume_path
+    logger, checkpoint = build_training_logger_and_checkpoint(ckpt_root)
+    stage_weights_path = ckpt_root / '.alternating_stage_weights.ckpt'
 
     for cycle_idx in range(alternating_cycles):
         cycle_name = f'cycle_{cycle_idx:02d}'
@@ -257,19 +281,18 @@ def run_alternating_training(
             warmup_step=warmup_step,
         )
         load_model_weights(descriptor_module, resume_path)
-        descriptor_logger, descriptor_checkpoint = build_stage_logger_and_checkpoint(ckpt_root, f'descriptor_{cycle_name}')
+        set_checkpoint_stage(checkpoint, f'descriptor_{cycle_name}')
         descriptor_trainer = pl.Trainer(
             max_epochs=descriptor_epochs,
-            default_root_dir=descriptor_logger.log_dir,
-            callbacks=[descriptor_checkpoint, ResampleDataCallback()],
-            logger=descriptor_logger,
+            default_root_dir=logger.log_dir,
+            callbacks=[checkpoint, ResampleDataCallback()],
+            logger=logger,
             check_val_every_n_epoch=1,
             **trainer_kwargs,
         )
         descriptor_trainer.fit(descriptor_module, datamodule=descriptor_dm)
-        descriptor_weights_path = ckpt_root / f'{cycle_name}_descriptor.ckpt'
-        save_model_weights(descriptor_module, descriptor_weights_path)
-        resume_path = descriptor_weights_path
+        save_model_weights(descriptor_module, stage_weights_path)
+        resume_path = stage_weights_path
 
         detector_dm = CombinedDataModule(
             megadepth_root_path=args.megadepth_root_path,
@@ -297,21 +320,24 @@ def run_alternating_training(
             test_data_root=args.test_data_root,
             model_config=deepcopy(model_config),
             warmup_step=warmup_step,
+            descriptor_detector_weighting=args.descriptor_detector_weighting,
+            descriptor_detector_weight_alpha=args.descriptor_detector_weight_alpha,
         )
         load_model_weights(detector_module, resume_path)
-        detector_logger, detector_checkpoint = build_stage_logger_and_checkpoint(ckpt_root, f'detector_{cycle_name}')
+        set_checkpoint_stage(checkpoint, f'detector_{cycle_name}')
         detector_trainer = pl.Trainer(
             max_epochs=detector_epochs,
-            default_root_dir=detector_logger.log_dir,
-            callbacks=[detector_checkpoint, ResampleDataCallback()],
-            logger=detector_logger,
+            default_root_dir=logger.log_dir,
+            callbacks=[checkpoint, ResampleDataCallback()],
+            logger=logger,
             check_val_every_n_epoch=1,
             **trainer_kwargs,
         )
         detector_trainer.fit(detector_module, datamodule=detector_dm)
-        detector_weights_path = ckpt_root / f'{cycle_name}_detector.ckpt'
-        save_model_weights(detector_module, detector_weights_path)
-        resume_path = detector_weights_path
+        save_model_weights(detector_module, stage_weights_path)
+        resume_path = stage_weights_path
+
+    stage_weights_path.unlink(missing_ok=True)
 
 
 def resolve_model_config(args: argparse.Namespace) -> dict:
@@ -346,6 +372,7 @@ def main() -> None:
     trainer_kwargs = prepare_trainer_kwargs(args)
 
     descriptor_best: Optional[Path] = None
+    logger, checkpoint = build_training_logger_and_checkpoint(ckpt_root)
 
     # scaling lr and warmup steps
     if trainer_kwargs["devices"] == 'auto':
@@ -380,6 +407,8 @@ def main() -> None:
             test_data_root=args.test_data_root,
             model_config=deepcopy(model_config),
             warmup_step=warmup_step,
+            descriptor_detector_weighting=args.descriptor_detector_weighting,
+            descriptor_detector_weight_alpha=args.descriptor_detector_weight_alpha,
         )
         descriptor_dm = CombinedDataModule(
             megadepth_root_path=args.megadepth_root_path,
@@ -396,12 +425,12 @@ def main() -> None:
             aerial_megadepth_root=args.aerial_megadepth_root,
             aerial_megadepth_npz_path=args.aerial_megadepth_npz_path,
         )
-        descriptor_logger, descriptor_checkpoint = build_stage_logger_and_checkpoint(ckpt_root, 'descriptor')
+        set_checkpoint_stage(checkpoint, 'descriptor')
         descriptor_trainer = pl.Trainer(
             max_epochs=args.descriptor_epochs,
-            default_root_dir=descriptor_logger.log_dir,
-            callbacks=[descriptor_checkpoint, ResampleDataCallback()],
-            logger=descriptor_logger,
+            default_root_dir=logger.log_dir,
+            callbacks=[checkpoint, ResampleDataCallback()],
+            logger=logger,
             check_val_every_n_epoch=1,
             **trainer_kwargs,
         )
@@ -410,8 +439,8 @@ def main() -> None:
             datamodule=descriptor_dm,
             ckpt_path=str(args.resume_descriptor) if args.resume_descriptor else None,
         )
-        if descriptor_checkpoint.best_model_path:
-            descriptor_best = Path(descriptor_checkpoint.best_model_path)
+        if checkpoint.best_model_path:
+            descriptor_best = Path(checkpoint.best_model_path)
         elif args.resume_descriptor:
             descriptor_best = args.resume_descriptor
 
@@ -431,6 +460,8 @@ def main() -> None:
             test_data_root=args.test_data_root,
             model_config=deepcopy(model_config),
             warmup_step=warmup_step,
+            descriptor_detector_weighting=args.descriptor_detector_weighting,
+            descriptor_detector_weight_alpha=args.descriptor_detector_weight_alpha,
         )
         detector_dm = CombinedDataModule(
             megadepth_root_path=args.megadepth_root_path,
@@ -448,12 +479,12 @@ def main() -> None:
             aerial_megadepth_npz_path=args.aerial_megadepth_npz_path,
         )
         detector_stage_name = 'joint' if joint_training else 'detector'
-        detector_logger, detector_checkpoint = build_stage_logger_and_checkpoint(ckpt_root, detector_stage_name)
+        set_checkpoint_stage(checkpoint, detector_stage_name)
         detector_trainer_kwargs = dict(
             max_epochs=args.descriptor_epochs if joint_training else args.detector_epochs,
-            default_root_dir=detector_logger.log_dir,
-            callbacks=[detector_checkpoint, ResampleDataCallback()],
-            logger=detector_logger,
+            default_root_dir=logger.log_dir,
+            callbacks=[checkpoint, ResampleDataCallback()],
+            logger=logger,
             check_val_every_n_epoch=1,
             **trainer_kwargs,
         )

@@ -44,6 +44,8 @@ class RDDLightningModule(pl.LightningModule):
         warmup_type: str = 'linear',
         warmup_ratio: float = 0.,
         plots_every: int = 50,
+        descriptor_detector_weighting: bool = False,
+        descriptor_detector_weight_alpha: float = 0.5,
     ) -> None:
         super().__init__()
         if stage not in {"descriptor", "detector"}:
@@ -63,6 +65,8 @@ class RDDLightningModule(pl.LightningModule):
                 "warmup_type": warmup_type,
                 "warmup_ratio": warmup_ratio,
                 "plots_every": plots_every,
+                "descriptor_detector_weighting": descriptor_detector_weighting,
+                "descriptor_detector_weight_alpha": descriptor_detector_weight_alpha,
             }
         )
 
@@ -96,7 +100,11 @@ class RDDLightningModule(pl.LightningModule):
         self.best_auc10 = 0.0
         self._skip_first_epoch_benchmark = True
         self.detector_loss = DetectorLoss(temperature=0.1, scores_th=0.1) if stage == "detector" else None
-        self.descriptor_loss = DescriptorLoss(inv_temp=20) if stage == "descriptor" or self.joint_training else None
+        self.descriptor_loss = DescriptorLoss(
+            inv_temp=20,
+            detector_weighting=descriptor_detector_weighting,
+            detector_weight_alpha=descriptor_detector_weight_alpha,
+        ) if stage == "descriptor" or self.joint_training else None
         self.warper = warper if stage == "descriptor" or self.joint_training else None
         self.validation_helper: Optional[RDD_helper] = None
         self.n_vals_plot = 32
@@ -157,6 +165,8 @@ class RDDLightningModule(pl.LightningModule):
         feats1: torch.Tensor,
         hmap0: torch.Tensor,
         hmap1: torch.Tensor,
+        scores_map0: Optional[torch.Tensor] = None,
+        scores_map1: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, float, float, float]:
         positives_md_coarse = self.warper.spvs_coarse(batch, getattr(self.model, "stride", 4))
 
@@ -181,7 +191,22 @@ class RDDLightningModule(pl.LightningModule):
             m1 = feats0[idx, :, pts1[:, 1], pts1[:, 0]].permute(1, 0)
             m2 = feats1[idx, :, pts2[:, 1], pts2[:, 0]].permute(1, 0)
 
-            loss_ds, loss_h, acc_kp = self.descriptor_loss(m1, m2, h1, h2, pts1, pts2)
+            detector_scores = None
+            if scores_map0 is not None and scores_map1 is not None:
+                score0 = scores_map0[idx, 0, pts1[:, 1], pts1[:, 0]]
+                score1 = scores_map1[idx, 0, pts2[:, 1], pts2[:, 0]]
+                detector_scores = 0.5 * (score0 + score1)
+                detector_scores = detector_scores.clamp(min=0.0)
+
+            loss_ds, loss_h, acc_kp = self.descriptor_loss(
+                m1,
+                m2,
+                h1,
+                h2,
+                pts1,
+                pts2,
+                detector_scores=detector_scores,
+            )
             loss_items.append(loss_ds + loss_h)
 
             acc_coarse_items.append(check_accuracy(m1, m2))
@@ -300,6 +325,8 @@ class RDDLightningModule(pl.LightningModule):
             feats1,
             hmap0,
             hmap1,
+            scores_map0,
+            scores_map1,
         )
 
         pred0 = {
@@ -338,14 +365,16 @@ class RDDLightningModule(pl.LightningModule):
         return loss
 
     def _descriptor_training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
-        feats1, _, hmap1 = self.model(batch["image0"])
-        feats2, _, hmap2 = self.model(batch["image1"])
+        feats1, scores_map1, hmap1 = self.model(batch["image0"])
+        feats2, scores_map2, hmap2 = self.model(batch["image1"])
         loss, acc_coarse, acc_kp, match_counts = self._compute_descriptor_loss_from_outputs(
             batch,
             feats1,
             feats2,
             hmap1,
             hmap2,
+            scores_map1,
+            scores_map2,
         )
 
         self._plot_training_matches(batch, use_model_detector=False)
