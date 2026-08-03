@@ -28,10 +28,29 @@ from src.utils.misc import lower_config
         --alternating_cycles 5 --descriptor_detector_weight_alpha 0.7
 
 如果想关闭这项机制：
-   python -m training.train ... --no-descriptor_detector_weighting
+   python -m training.train ... --no-descriptor_detector_weighting --ckpt_save_path checkpoints/ --megadepth_root_path datasets/ --batch_size 1 
+         --alternating_training --alternating_descriptor_epochs 4 --alternating_detector_epochs 1 
+          --alternating_cycles 5 
 
 如果想用回原来的先训练descriptor 再训练detector 的方法，使用如下指令 
-python -m training.train --no-alternating_training
+  (1)这是训练descriptor
+  python -m training.train `
+  --no-alternating_training `
+  --ckpt_save_path checkpoints `
+  --megadepth_root_path datasets `
+  --batch_size 1 `
+  --descriptor_epochs 20 `
+  --no-descriptor_detector_weighting
+  
+  (2) 接着训练detector
+  python -m training.train `
+  --no-alternating_training `
+  --train_detector `
+  --detector_from checkpoints/descriptor/version_0/checkpoints/descriptor-epoch=12-step=00001234-auc@10=0.650.ckpt `
+  --ckpt_save_path checkpoints `
+  --megadepth_root_path datasets `
+  --batch_size 1 `
+  --detector_epochs 20
 """
 
 
@@ -185,8 +204,11 @@ def prepare_trainer_kwargs(args: argparse.Namespace) -> dict:
     return kwargs
 
 
-def build_training_logger_and_checkpoint(ckpt_root: Path) -> tuple[TensorBoardLogger, ModelCheckpoint]:
-    logger = TensorBoardLogger(str(ckpt_root), name='training')
+def build_training_logger_and_checkpoint(
+    ckpt_root: Path,
+    run_name: str = 'training',
+) -> tuple[TensorBoardLogger, ModelCheckpoint]:
+    logger = TensorBoardLogger(str(ckpt_root), name=run_name)
     checkpoint = ModelCheckpoint(
         dirpath=str(Path(logger.log_dir) / 'checkpoints'),
         filename='rdd-{epoch:02d}-{step:08d}-{auc@10:.3f}',
@@ -422,7 +444,6 @@ def main() -> None:
     trainer_kwargs = prepare_trainer_kwargs(args)
 
     descriptor_best: Optional[Path] = None
-    logger, checkpoint = build_training_logger_and_checkpoint(ckpt_root)
 
     # scaling lr and warmup steps
     if trainer_kwargs["devices"] == 'auto':
@@ -446,6 +467,10 @@ def main() -> None:
         return
 
     if not args.train_detector:
+        descriptor_logger, descriptor_checkpoint = build_training_logger_and_checkpoint(
+            ckpt_root,
+            run_name='descriptor',
+        )
         descriptor_module = RDDLightningModule(
             stage='descriptor',
             lr=true_lr,
@@ -475,12 +500,12 @@ def main() -> None:
             aerial_megadepth_root=args.aerial_megadepth_root,
             aerial_megadepth_npz_path=args.aerial_megadepth_npz_path,
         )
-        set_checkpoint_stage(checkpoint, 'descriptor')
+        set_checkpoint_stage(descriptor_checkpoint, 'descriptor')
         descriptor_trainer = pl.Trainer(
             max_epochs=args.descriptor_epochs,
-            default_root_dir=logger.log_dir,
-            callbacks=[checkpoint, ResampleDataCallback()],
-            logger=logger,
+            default_root_dir=descriptor_logger.log_dir,
+            callbacks=[descriptor_checkpoint, ResampleDataCallback()],
+            logger=descriptor_logger,
             check_val_every_n_epoch=1,
             **trainer_kwargs,
         )
@@ -489,12 +514,16 @@ def main() -> None:
             datamodule=descriptor_dm,
             ckpt_path=str(args.resume_descriptor) if args.resume_descriptor else None,
         )
-        if checkpoint.best_model_path:
-            descriptor_best = Path(checkpoint.best_model_path)
+        if descriptor_checkpoint.best_model_path:
+            descriptor_best = Path(descriptor_checkpoint.best_model_path)
         elif args.resume_descriptor:
             descriptor_best = args.resume_descriptor
 
     if args.train_detector:
+        detector_logger, detector_checkpoint = build_training_logger_and_checkpoint(
+            ckpt_root,
+            run_name='detector',
+        )
         init_weights = args.detector_from or descriptor_best
         if init_weights is None and not joint_training:
             raise ValueError("Detector stage requested but no descriptor weights were provided. "
@@ -529,12 +558,12 @@ def main() -> None:
             aerial_megadepth_npz_path=args.aerial_megadepth_npz_path,
         )
         detector_stage_name = 'joint' if joint_training else 'detector'
-        set_checkpoint_stage(checkpoint, detector_stage_name)
+        set_checkpoint_stage(detector_checkpoint, detector_stage_name)
         detector_trainer_kwargs = dict(
             max_epochs=args.descriptor_epochs if joint_training else args.detector_epochs,
-            default_root_dir=logger.log_dir,
-            callbacks=[checkpoint, ResampleDataCallback()],
-            logger=logger,
+            default_root_dir=detector_logger.log_dir,
+            callbacks=[detector_checkpoint, ResampleDataCallback()],
+            logger=detector_logger,
             check_val_every_n_epoch=1,
             **trainer_kwargs,
         )
