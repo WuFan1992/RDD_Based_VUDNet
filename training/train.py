@@ -306,8 +306,8 @@ def main() -> None:
             check_val_every_n_epoch=1,
             **trainer_kwargs,
         )
-        if not joint_training:
-            detector_trainer_kwargs["val_check_interval"] = 32000 // true_batch_size
+        #if not joint_training:
+        #    detector_trainer_kwargs["val_check_interval"] = 32000 // true_batch_size
         detector_trainer = pl.Trainer(**detector_trainer_kwargs)
         detector_trainer.fit(
             detector_module,
