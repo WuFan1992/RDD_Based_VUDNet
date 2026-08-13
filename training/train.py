@@ -17,7 +17,7 @@ from src.utils.misc import lower_config
 
 
 """
-python training/train.py --ckpt_save_path /checkpoints/ --megadepth_root_path /datasets/ --batch_size 1 
+python -m training.train --ckpt_save_path checkpoints/ --megadepth_root_path datasets/ --batch_size 1 
 """
 
 
@@ -170,13 +170,16 @@ def resolve_model_config(args: argparse.Namespace) -> dict:
     cfg = get_cfg_defaults()
     if args.config is not None:
         cfg.merge_from_file(str(args.config))
+        print(f"[config] using explicit config file: {args.config}")
         return lower_config(cfg)['rdd']
 
     for checkpoint_path in (args.resume_detector, args.detector_from, args.resume_descriptor):
         model_config = load_model_config_from_checkpoint(checkpoint_path)
         if model_config is not None:
+            print(f"[config] using model_config from checkpoint: {checkpoint_path}")
             return model_config
 
+    print("[config] using default config: src/config/default.py")
     return lower_config(cfg)['rdd']
 
 

@@ -1,24 +1,27 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from ..utils.misc import NestedTensor, nested_tensor_from_tensor_list
 from .backbone import build_backbone
+from .canonicalization import CanonicalDescriptorHead, CanonicalSampler, LocalGeometryHead
 from .deformable_transformer import build_deformable_transformer
 
-class BasicLayer(nn.Module):
-	"""
-	  Basic Convolutional Layer: Conv2d -> BatchNorm -> ReLU
-	"""
-	def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, dilation=1, bias=False):
-		super().__init__()
-		self.layer = nn.Sequential(
-									  nn.Conv2d( in_channels, out_channels, kernel_size, padding = padding, stride=stride, dilation=dilation, bias = bias),
-									  nn.BatchNorm2d(out_channels, affine=False),
-									  nn.ReLU(inplace = False),
-									)
 
-	def forward(self, x):
-	  return self.layer(x)
+class BasicLayer(nn.Module):
+    """Basic Convolutional Layer: Conv2d -> BatchNorm -> ReLU"""
+
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, dilation=1, bias=False):
+        super().__init__()
+        self.layer = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding, stride=stride, dilation=dilation, bias=bias),
+            nn.BatchNorm2d(out_channels, affine=False),
+            nn.ReLU(inplace=False),
+        )
+
+    def forward(self, x):
+        return self.layer(x)
+
 
 class RDD_Descriptor(nn.Module):
     def __init__(self, backbone, hidden_dim, num_feature_levels, transformer=None):
@@ -27,16 +30,18 @@ class RDD_Descriptor(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_feature_levels = num_feature_levels
         self.use_deformable_transformer = transformer is not None
+        self.use_canonical_descriptor = False
+        self.geometry_neighborhood_size = 5
 
         matchibility_hidden_dim = max(self.hidden_dim // 2, 64)
         matchibility_low_dim = max(matchibility_hidden_dim // 2, 32)
-        
+
         self.matchibility_head = nn.Sequential(
-										BasicLayer(self.hidden_dim, matchibility_hidden_dim, 1, padding=0),
-										BasicLayer(matchibility_hidden_dim, matchibility_low_dim, 1, padding=0),
-										nn.Conv2d(matchibility_low_dim, 1, 1),
-										nn.Sigmoid()
-									)
+            BasicLayer(self.hidden_dim, matchibility_hidden_dim, 1, padding=0),
+            BasicLayer(matchibility_hidden_dim, matchibility_low_dim, 1, padding=0),
+            nn.Conv2d(matchibility_low_dim, 1, 1),
+            nn.Sigmoid(),
+        )
 
         if num_feature_levels > 1:
             num_backbone_outs = len(backbone.strides)
@@ -65,12 +70,11 @@ class RDD_Descriptor(nn.Module):
         for proj in self.input_proj:
             nn.init.xavier_uniform_(proj[0].weight, gain=1)
             nn.init.constant_(proj[0].bias, 0)
-            
-    def forward(self, samples: NestedTensor):
-        
+
+    def _encode(self, samples: NestedTensor):
         if not isinstance(samples, NestedTensor):
             samples = nested_tensor_from_tensor_list(samples)
-        
+
         features, pos = self.backbone(samples)
 
         srcs = []
@@ -96,7 +100,7 @@ class RDD_Descriptor(nn.Module):
                 srcs.append(src)
                 masks.append(mask)
                 pos.append(pos_l)
-        
+
         if self.use_deformable_transformer:
             flatten_feats, spatial_shapes, level_start_index = self.transformer(srcs, masks, pos)
             feats = []
@@ -109,26 +113,57 @@ class RDD_Descriptor(nn.Module):
                 temp = flatten_feats[:, level_start_index[i]: level_start_index[i + 1], :]
                 feats.append(temp.transpose(1, 2).view(-1, self.hidden_dim, *shape))
         else:
-            # ConvNeXt-only baseline: use projected backbone features directly.
             feats = srcs
 
         final_feature = feats[0]
         for feat in feats[1:]:
             final_feature = final_feature + F.interpolate(feat, size=final_feature.shape[-2:], mode='bilinear', align_corners=False)
-        
+
         matchibility = self.matchibility_head(final_feature)
-        
         return final_feature, matchibility
-    
-    
+
+    def canonical_descriptors_from_features(self, feature_map: torch.Tensor, keypoints_feat: torch.Tensor):
+        if not self.use_canonical_descriptor:
+            raise RuntimeError('Canonical descriptor branch is disabled in the current config.')
+
+        local_neighborhood = self.canonical_sampler.sample_neighborhood(
+            feature_map,
+            keypoints_feat,
+            neighborhood_size=self.geometry_neighborhood_size,
+        )
+        affine = self.geometry_head(local_neighborhood)
+        canonical_patch, valid_mask, canonical_coords = self.canonical_sampler(feature_map, keypoints_feat, affine)
+        descriptors = self.canonical_descriptor_head(canonical_patch)
+        descriptors = F.normalize(descriptors, dim=-1)
+        return descriptors, affine, valid_mask, canonical_patch, canonical_coords
+
+    def forward(self, samples: NestedTensor):
+        return self._encode(samples)
+
+
 def build_descriptor(config):
     backbone = build_backbone(config)
     transformer = None
     if config.get('use_deformable_transformer', True):
         transformer = build_deformable_transformer(config)
-    return RDD_Descriptor(
+    descriptor = RDD_Descriptor(
         backbone,
         hidden_dim=config['d_model'],
         num_feature_levels=config['num_feature_levels'],
         transformer=transformer,
     )
+    descriptor.use_canonical_descriptor = bool(config.get('use_canonical_descriptor', False))
+    if descriptor.use_canonical_descriptor:
+        descriptor.geometry_head = LocalGeometryHead(
+            descriptor.hidden_dim,
+            patch_size=descriptor.geometry_neighborhood_size,
+            hidden_dim=config.get('geometry_head_hidden_dim', max(descriptor.hidden_dim // 2, 64)),
+        )
+        descriptor.canonical_sampler = CanonicalSampler(
+            grid_size=config.get('canonical_grid_size', 16),
+            radius=config.get('canonical_radius', 8.0),
+            align_corners=config.get('canonical_align_corners', False),
+            padding_mode=config.get('canonical_padding_mode', 'border'),
+        )
+        descriptor.canonical_descriptor_head = CanonicalDescriptorHead(descriptor.hidden_dim)
+    return descriptor

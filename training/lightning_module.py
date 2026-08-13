@@ -18,6 +18,7 @@ from src.dataset import warper
 from training.losses.detector_loss import DetectorLoss, compute_correspondence
 from training.losses.descriptor_loss import DescriptorLoss
 from training.utils import check_accuracy, compute_symmetrical_epipolar_errors, aggregate_metrics, compute_pose_errors
+from src.models.canonicalization import compute_local_jacobian, geometry_loss
 from training.plotting import (
     make_matching_figures,
     close_figures,
@@ -92,6 +93,10 @@ class RDDLightningModule(pl.LightningModule):
             for param in self.model.detector.parameters():
                 param.requires_grad = False
         self.stage = stage
+        descriptor_cfg = model_config.get('descriptor', {})
+        self.use_canonical_descriptor = bool(descriptor_cfg.get('use_canonical_descriptor', False))
+        self.lambda_geo = float(model_config.get('lambda_geo', 0.01))
+        self.jacobian_epsilon = float(descriptor_cfg.get('geometry_jacobian_eps', 1.0))
 
         self.best_auc10 = 0.0
         self._skip_first_epoch_benchmark = True
@@ -100,6 +105,8 @@ class RDDLightningModule(pl.LightningModule):
         self.warper = warper if stage == "descriptor" or self.joint_training else None
         self.validation_helper: Optional[RDD_helper] = None
         self.n_vals_plot = 32
+        self._canonical_debug_printed = False
+        self._canonical_warning_printed = False
 
     # Lightning hooks ---------------------------------------------------------------
     def configure_optimizers(self):
@@ -157,32 +164,126 @@ class RDDLightningModule(pl.LightningModule):
         feats1: torch.Tensor,
         hmap0: torch.Tensor,
         hmap1: torch.Tensor,
-    ) -> tuple[torch.Tensor, float, float, float]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, float, float, torch.Tensor, Dict[str, float], Dict[str, float]]:
         positives_md_coarse = self.warper.spvs_coarse(batch, getattr(self.model, "stride", 4))
 
         loss_items = []
+        loss_ds_items = []
+        loss_h_items = []
         acc_coarse_items: List[float] = []
         acc_kp_items: List[float] = []
         match_counts = 0
+        geo_loss_items = []
+        geo_stats_items: Dict[str, List[float]] = defaultdict(list)
+        canonical_sampler = getattr(getattr(self.model, "descriptor", None), "canonical_sampler", None)
+        geo_debug = {
+            "geo_num_pairs": 0.0,
+            "geo_num_skipped_lt30": 0.0,
+            "geo_num_positives": 0.0,
+            "geo_num_mask0_valid": 0.0,
+            "geo_num_mask1_valid": 0.0,
+            "geo_num_pre_jac_valid": 0.0,
+            "geo_num_jac_valid": 0.0,
+            "geo_num_geo_valid": 0.0,
+            "geo_loss_raw": 0.0,
+            "geo_feat_h": 0.0,
+            "geo_feat_w": 0.0,
+            "geo_kp_x_min": float("inf"),
+            "geo_kp_x_max": float("-inf"),
+            "geo_kp_y_min": float("inf"),
+            "geo_kp_y_max": float("-inf"),
+            "geo_center_valid": 0.0,
+            "geo_canon_enabled": 1.0 if self.use_canonical_descriptor else 0.0,
+            "geo_canon_ready": 1.0 if canonical_sampler is not None else 0.0,
+        }
 
         for idx, positives in enumerate(positives_md_coarse):
             if positives is None or len(positives) < 30:
+                geo_debug["geo_num_skipped_lt30"] += 1.0
                 continue
+            geo_debug["geo_num_pairs"] += 1.0
+            geo_debug["geo_num_positives"] += float(len(positives))
             if len(positives) > 10000:
                 perm = torch.randperm(len(positives), device=positives.device)
                 positives = positives[perm[:10000]]
 
-            pts1 = positives[:, :2].long()
-            pts2 = positives[:, 2:].long()
+            pts1 = positives[:, :2].float()
+            pts2 = positives[:, 2:].float()
+
+            feat_h = float(feats0.shape[-2])
+            feat_w = float(feats0.shape[-1])
+            canonical_radius = float(getattr(canonical_sampler, "radius", 0.0)) if self.use_canonical_descriptor else 0.0
+            geo_debug["geo_feat_h"] = feat_h
+            geo_debug["geo_feat_w"] = feat_w
+            geo_debug["geo_kp_x_min"] = min(geo_debug["geo_kp_x_min"], float(torch.min(pts1[:, 0]).detach().cpu()))
+            geo_debug["geo_kp_x_max"] = max(geo_debug["geo_kp_x_max"], float(torch.max(pts1[:, 0]).detach().cpu()))
+            geo_debug["geo_kp_y_min"] = min(geo_debug["geo_kp_y_min"], float(torch.min(pts1[:, 1]).detach().cpu()))
+            geo_debug["geo_kp_y_max"] = max(geo_debug["geo_kp_y_max"], float(torch.max(pts1[:, 1]).detach().cpu()))
+            if self.use_canonical_descriptor:
+                center_valid = (
+                    (pts1[:, 0] >= canonical_radius)
+                    & (pts1[:, 0] <= (feat_w - 1.0 - canonical_radius))
+                    & (pts1[:, 1] >= canonical_radius)
+                    & (pts1[:, 1] <= (feat_h - 1.0 - canonical_radius))
+                )
+                geo_debug["geo_center_valid"] += float(center_valid.sum().detach().cpu())
 
             h1 = hmap0[idx]
             h2 = hmap1[idx]
 
-            m1 = feats0[idx, :, pts1[:, 1], pts1[:, 0]].permute(1, 0)
-            m2 = feats1[idx, :, pts2[:, 1], pts2[:, 0]].permute(1, 0)
+            if self.use_canonical_descriptor:
+                d0, A0, mask0, _, _ = self.model.descriptor.canonical_descriptors_from_features(
+                    feats0[idx:idx + 1],
+                    pts1[None],
+                )
+                d1, A1, mask1, _, _ = self.model.descriptor.canonical_descriptors_from_features(
+                    feats1[idx:idx + 1],
+                    pts2[None],
+                )
+                m1 = d0[0]
+                m2 = d1[0]
+                A0 = A0[0]
+                A1 = A1[0]
+                geo_valid = mask0[0] & mask1[0]
+                geo_debug["geo_num_mask0_valid"] += float(mask0[0].sum().detach().cpu())
+                geo_debug["geo_num_mask1_valid"] += float(mask1[0].sum().detach().cpu())
+                geo_debug["geo_num_pre_jac_valid"] += float(geo_valid.sum().detach().cpu())
 
-            loss_ds, loss_h, acc_kp = self.descriptor_loss(m1, m2, h1, h2, pts1, pts2)
+                warp_params = {
+                    key: (value[idx].to(feats0.device) if isinstance(value, torch.Tensor) else value)
+                    for key, value in batch['warp01_params'].items()
+                }
+                J_gt, jac_valid = compute_local_jacobian(
+                    pts1,
+                    warp_params,
+                    feature_stride=getattr(self.model, 'stride', 4),
+                    epsilon=self.jacobian_epsilon,
+                )
+                geo_valid = geo_valid & jac_valid
+                geo_debug["geo_num_jac_valid"] += float(jac_valid.sum().detach().cpu())
+                geo_debug["geo_num_geo_valid"] += float(geo_valid.sum().detach().cpu())
+                geo_loss = geometry_loss(A0, A1, J_gt, geo_valid)
+                geo_debug["geo_loss_raw"] += float(geo_loss.detach().cpu())
+                geo_loss_items.append(geo_loss)
+                if torch.any(geo_valid):
+                    geo_stats_items['a0_mean'].append(float(A0[geo_valid].mean().detach().cpu()))
+                    geo_stats_items['a0_std'].append(float(A0[geo_valid].std(unbiased=False).detach().cpu()))
+                    geo_stats_items['a1_mean'].append(float(A1[geo_valid].mean().detach().cpu()))
+                    geo_stats_items['a1_std'].append(float(A1[geo_valid].std(unbiased=False).detach().cpu()))
+                    geo_stats_items['det_a0'].append(float(torch.linalg.det(A0[geo_valid]).mean().detach().cpu()))
+                    geo_stats_items['det_a1'].append(float(torch.linalg.det(A1[geo_valid]).mean().detach().cpu()))
+                    geo_stats_items['j_gt_mean'].append(float(J_gt[geo_valid].mean().detach().cpu()))
+                    geo_stats_items['j_gt_std'].append(float(J_gt[geo_valid].std(unbiased=False).detach().cpu()))
+            else:
+                m1 = feats0[idx, :, pts1.long()[:, 1], pts1.long()[:, 0]].permute(1, 0)
+                m2 = feats1[idx, :, pts2.long()[:, 1], pts2.long()[:, 0]].permute(1, 0)
+                geo_loss = feats0[idx].sum() * 0.0
+                geo_loss_items.append(geo_loss)
+
+            loss_ds, loss_h, acc_kp = self.descriptor_loss(m1, m2, h1, h2, pts1.long(), pts2.long())
             loss_items.append(loss_ds + loss_h)
+            loss_ds_items.append(loss_ds)
+            loss_h_items.append(loss_h)
 
             acc_coarse_items.append(check_accuracy(m1, m2))
             acc_kp_items.append(acc_kp)
@@ -191,12 +292,62 @@ class RDDLightningModule(pl.LightningModule):
         match_counts /= max(1, len(batch["image0"]))
         if not loss_items:
             zero = (feats0.sum() + feats1.sum() + hmap0.sum() + hmap1.sum()) * 0.0
-            return zero, 0.0, 0.0, float(match_counts)
+            return zero, zero, zero, 0.0, 0.0, float(match_counts), zero, {}, geo_debug
 
         loss = torch.stack(loss_items).mean()
+        loss_ds = torch.stack(loss_ds_items).mean()
+        loss_h = torch.stack(loss_h_items).mean()
+        geo_loss = torch.stack(geo_loss_items).mean() if geo_loss_items else loss * 0.0
         acc_coarse = sum(acc_coarse_items) / len(acc_coarse_items)
         acc_kp = sum(acc_kp_items) / len(acc_kp_items)
-        return loss, acc_coarse, acc_kp, float(match_counts)
+        geo_stats = {k: float(sum(v) / len(v)) for k, v in geo_stats_items.items() if v}
+        return loss, loss_ds, loss_h, acc_coarse, acc_kp, float(match_counts), geo_loss, geo_stats, geo_debug
+
+    def _log_geo_debug(self, geo_debug: Dict[str, float]) -> None:
+        if not geo_debug:
+            return
+        if self.trainer.global_rank != 0:
+            return
+        if not getattr(self, "_canonical_debug_printed", False):
+            canonical_sampler = getattr(getattr(self.model, "descriptor", None), "canonical_sampler", None)
+            print(
+                "[geo-config] "
+                f"use_canonical_descriptor={self.use_canonical_descriptor} "
+                f"has_canonical_sampler={canonical_sampler is not None} "
+                f"canonical_radius={getattr(canonical_sampler, 'radius', 0.0):.1f} "
+                f"canonical_grid_size={getattr(canonical_sampler, 'grid_size', 0)}"
+            )
+            self._canonical_debug_printed = True
+        if (
+            self.lambda_geo > 0.0
+            and not self.use_canonical_descriptor
+            and not getattr(self, "_canonical_warning_printed", False)
+        ):
+            print(
+                "[geo-warning] "
+                "lambda_geo > 0 but canonical descriptor is disabled; "
+                "train/loss_geo will stay zero by design."
+            )
+            self._canonical_warning_printed = True
+        message = (
+            "[geo-debug] "
+            f"step={self.global_step} "
+            f"canon={int(geo_debug.get('geo_canon_enabled', 0.0))}/{int(geo_debug.get('geo_canon_ready', 0.0))} "
+            f"pairs={int(geo_debug.get('geo_num_pairs', 0.0))} "
+            f"skip_lt30={int(geo_debug.get('geo_num_skipped_lt30', 0.0))} "
+            f"positives={int(geo_debug.get('geo_num_positives', 0.0))} "
+            f"mask0={int(geo_debug.get('geo_num_mask0_valid', 0.0))} "
+            f"mask1={int(geo_debug.get('geo_num_mask1_valid', 0.0))} "
+            f"pre_jac={int(geo_debug.get('geo_num_pre_jac_valid', 0.0))} "
+            f"jac={int(geo_debug.get('geo_num_jac_valid', 0.0))} "
+            f"geo={int(geo_debug.get('geo_num_geo_valid', 0.0))} "
+            f"raw_loss={geo_debug.get('geo_loss_raw', 0.0):.6f} "
+            f"kpx=[{geo_debug.get('geo_kp_x_min', float('inf')):.1f},{geo_debug.get('geo_kp_x_max', float('-inf')):.1f}] "
+            f"kpy=[{geo_debug.get('geo_kp_y_min', float('inf')):.1f},{geo_debug.get('geo_kp_y_max', float('-inf')):.1f}] "
+            f"center_ok={int(geo_debug.get('geo_center_valid', 0.0))} "
+            f"feat_hw={int(geo_debug.get('geo_feat_h', 0.0))}x{int(geo_debug.get('geo_feat_w', 0.0))}"
+        )
+        #print(message)
 
     def _plot_training_matches(self, batch: Dict[str, torch.Tensor], *, use_model_detector: bool) -> None:
         plots_every = self.hparams.plots_every
@@ -294,7 +445,7 @@ class RDDLightningModule(pl.LightningModule):
         feats0, scores_map0, hmap0 = self.model(batch["image0"])
         feats1, scores_map1, hmap1 = self.model(batch["image1"])
 
-        descriptor_loss, acc_coarse, acc_kp, descriptor_matches = self._compute_descriptor_loss_from_outputs(
+        descriptor_loss, loss_ds, loss_h, acc_coarse, acc_kp, descriptor_matches, geo_loss, geo_stats, geo_debug = self._compute_descriptor_loss_from_outputs(
             batch,
             feats0,
             feats1,
@@ -322,16 +473,23 @@ class RDDLightningModule(pl.LightningModule):
 
         detector_loss = self.detector_loss(correspondences, pred0_with_rand, pred1_with_rand)
         detector_matches = sum(len(c.get("ids0_d", [])) for c in correspondences) / len(correspondences) if correspondences else 0
-        loss = descriptor_loss + detector_loss
+        loss = descriptor_loss + detector_loss + self.lambda_geo * geo_loss
 
         self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("train/loss_descriptor", descriptor_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/loss_original_rdd", descriptor_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/loss_dual_softmax", loss_ds, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/loss_heatmap", loss_h, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/loss_detector", detector_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/loss_geo", geo_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/lr", self.trainer.optimizers[0].param_groups[0]['lr'], prog_bar=False, on_step=True, on_epoch=False, sync_dist=True)
         self.log("train/acc_coarse", acc_coarse, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/acc_kp", acc_kp, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/matches_descriptor", descriptor_matches, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/matches_detector", detector_matches, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        if geo_stats:
+            for key, value in geo_stats.items():
+                self.log(f"train/{key}", value, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self._log_geo_debug(geo_debug)
 
         self._plot_training_matches(batch, use_model_detector=True)
 
@@ -340,7 +498,7 @@ class RDDLightningModule(pl.LightningModule):
     def _descriptor_training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
         feats1, _, hmap1 = self.model(batch["image0"])
         feats2, _, hmap2 = self.model(batch["image1"])
-        loss, acc_coarse, acc_kp, match_counts = self._compute_descriptor_loss_from_outputs(
+        loss, loss_ds, loss_h, acc_coarse, acc_kp, match_counts, geo_loss, geo_stats, geo_debug = self._compute_descriptor_loss_from_outputs(
             batch,
             feats1,
             feats2,
@@ -348,15 +506,25 @@ class RDDLightningModule(pl.LightningModule):
             hmap2,
         )
 
+        total_loss = loss + self.lambda_geo * geo_loss
+
         self._plot_training_matches(batch, use_model_detector=False)
 
-        self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/loss", total_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/loss_original_rdd", loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/loss_dual_softmax", loss_ds, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/loss_heatmap", loss_h, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/loss_geo", geo_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/lr", self.trainer.optimizers[0].param_groups[0]['lr'], prog_bar=False, on_step=True, on_epoch=False, sync_dist=True)
         self.log("train/acc_coarse", acc_coarse, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/acc_kp", acc_kp, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/matches", float(match_counts), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+        if geo_stats:
+            for key, value in geo_stats.items():
+                self.log(f"train/{key}", value, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self._log_geo_debug(geo_debug)
 
-        return loss
+        return total_loss
 
     # Validation --------------------------------------------------------------------
     def _compute_metrics(self, batch):

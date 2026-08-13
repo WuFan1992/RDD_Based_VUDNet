@@ -62,6 +62,15 @@ class RDD(nn.Module):
         feats, matchibility = self.descriptor(samples)
         
         return feats, scoremap, matchibility
+
+    def _describe_keypoints(self, feature_map: torch.Tensor, keypoints: torch.Tensor, image_hw: tuple[int, int]) -> torch.Tensor:
+        if getattr(self.descriptor, 'use_canonical_descriptor', False):
+            keypoints_feat = keypoints / float(self.stride)
+            descriptors, _, _, _, _ = self.descriptor.canonical_descriptors_from_features(feature_map, keypoints_feat)
+            return descriptors
+
+        descriptors = self.interpolator(feature_map, keypoints, H=image_hw[0], W=image_hw[1])
+        return F.normalize(descriptors, dim=-1)
     
     def set_softdetect(self, top_k=4096, scores_th=0.01):
         self.softdetect = SoftDetect(radius=2, top_k=top_k, scores_th=scores_th).to(self.device)
@@ -90,10 +99,8 @@ class RDD(nn.Module):
         
         keypoints = torch.vstack([keypoints[b].unsqueeze(0) for b in range(B)])
         kptscores = torch.vstack([kptscores[b].unsqueeze(0) for b in range(B)])
-        
-        feats = self.interpolator(M1, keypoints, H = _H1, W = _W1)
-        
-        feats = F.normalize(feats, dim=-1)
+
+        feats = self._describe_keypoints(M1, keypoints, (_H1, _W1))
 		
         # Correct kpt scale
         keypoints = keypoints * torch.tensor([rw1,rh1], device=keypoints.device).view(1, -1)
@@ -126,8 +133,7 @@ class RDD(nn.Module):
             mkpts = mkpts[:,idx]
             scores = scores[:,idx]
 
-        feats = self.interpolator(M1, mkpts, H = _H1, W = _W1)
-        feats = F.normalize(feats, dim=-1)
+        feats = self._describe_keypoints(M1, mkpts, (_H1, _W1))
         mkpts = mkpts * torch.tensor([rw1,rh1], device=mkpts.device).view(1, 1, -1)
         
         return [  
@@ -152,10 +158,7 @@ class RDD(nn.Module):
         
         keypoints = torch.vstack([keypoints[b].unsqueeze(0) for b in range(B)])
         kptscores = torch.vstack([kptscores[b].unsqueeze(0) for b in range(B)])
-        
-        feats = self.interpolator(M1, keypoints, H = _H1, W = _W1)
-        
-        feats = F.normalize(feats, dim=-1)
+        feats = self._describe_keypoints(M1, keypoints, (_H1, _W1))
         
         H1 = self.filter(H1)
         
@@ -163,9 +166,7 @@ class RDD(nn.Module):
  
         dense_keypoints = to_pixel_coords(dense_kpts, _H1, _W1)
 
-        dense_feats = self.interpolator(M1, dense_keypoints, H = _H1, W = _W1)
-        
-        dense_feats = F.normalize(dense_feats, dim=-1)
+        dense_feats = self._describe_keypoints(M1, dense_keypoints, (_H1, _W1))
         
         keypoints = keypoints * torch.tensor([rw1,rh1], device=keypoints.device).view(1, -1)
         dense_keypoints = dense_keypoints * torch.tensor([rw1,rh1], device=dense_keypoints.device).view(1, -1)	
@@ -308,5 +309,6 @@ def build(config=None, weights=None, config_file=None):
                 # if keys start with model. remove it
                 if list(state.keys())[0].startswith('model.'):
                     state = {k[len('model.'):]: v for k, v in state.items()}
-        model.load_state_dict(state, strict=True)
+            strict = not config['descriptor'].get('use_canonical_descriptor', False)
+            model.load_state_dict(state, strict=strict)
     return model
