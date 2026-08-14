@@ -364,6 +364,7 @@ def compute_correspondence(
     train_gt_th=5,
     score_map_temperature=0.1,
     similarity_chunk_size=8192,
+    use_canonical_descriptor=False,
     debug=False,
 ):
     b, c, h, w = pred0['scores_map'].shape
@@ -534,40 +535,94 @@ def compute_correspondence(
 
         dist_l1 = (dist01_l1 + dist10_l1.t()) / 2.
 
-        descriptor_map0 = F.normalize(pred0['descriptor_map'][idx].detach(), dim=0)
-        descriptor_map1 = F.normalize(pred1['descriptor_map'][idx].detach(), dim=0)
+        if ids0.numel() > 0:
+            if ids0.min().item() < 0 or ids0.max().item() >= kpts0.shape[0]:
+                raise RuntimeError(
+                    f"ids0 out of range: min={ids0.min().item()}, max={ids0.max().item()}, len(kpts0)={kpts0.shape[0]}"
+                )
+        if ids1.numel() > 0:
+            if ids1.min().item() < 0 or ids1.max().item() >= kpts1.shape[0]:
+                raise RuntimeError(
+                    f"ids1 out of range: min={ids1.min().item()}, max={ids1.max().item()}, len(kpts1)={kpts1.shape[0]}"
+                )
 
         valid_kpts0 = kpts0[ids0].detach()
         valid_kpts1 = kpts1[ids1].detach()
-        desc0_valid = torch.nn.functional.grid_sample(
-            descriptor_map0.unsqueeze(0),
-            valid_kpts0.view(1, 1, -1, 2),
-            mode='bilinear',
-            align_corners=True,
-        )[0, :, 0, :].t()
-        desc1_valid = torch.nn.functional.grid_sample(
-            descriptor_map1.unsqueeze(0),
-            valid_kpts1.view(1, 1, -1, 2),
-            mode='bilinear',
-            align_corners=True,
-        )[0, :, 0, :].t()
-        desc0_valid = F.normalize(desc0_valid, dim=-1)
-        desc1_valid = F.normalize(desc1_valid, dim=-1)
 
-        repeatability01 = compute_repeatability(
-            desc0_valid,
-            descriptor_map1,
-            kpts01_wh,
-            pmf_temperature=score_map_temperature,
-            chunk_size=similarity_chunk_size,
-        )
-        repeatability10 = compute_repeatability(
-            desc1_valid,
-            descriptor_map0,
-            kpts10_wh,
-            pmf_temperature=score_map_temperature,
-            chunk_size=similarity_chunk_size,
-        )
+        if use_canonical_descriptor and getattr(model.descriptor, 'use_canonical_descriptor', False):
+            descriptor_map0 = pred0['descriptor_map'][idx].detach().unsqueeze(0)
+            descriptor_map1 = pred1['descriptor_map'][idx].detach().unsqueeze(0)
+            feature_stride = float(getattr(model, 'stride', 4))
+
+            desc0_src, _, mask0_src, _, _ = model.descriptor.canonical_descriptors_from_features(
+                descriptor_map0,
+                (kpts0_wh.detach() / feature_stride).unsqueeze(0),
+            )
+            desc0_warp, _, mask0_warp, _, _ = model.descriptor.canonical_descriptors_from_features(
+                descriptor_map1,
+                (kpts01_wh.detach() / feature_stride).unsqueeze(0),
+            )
+            desc1_src, _, mask1_src, _, _ = model.descriptor.canonical_descriptors_from_features(
+                descriptor_map1,
+                (kpts1_wh.detach() / feature_stride).unsqueeze(0),
+            )
+            desc1_warp, _, mask1_warp, _, _ = model.descriptor.canonical_descriptors_from_features(
+                descriptor_map0,
+                (kpts10_wh.detach() / feature_stride).unsqueeze(0),
+            )
+
+            desc0_src = desc0_src[0]
+            desc0_warp = desc0_warp[0]
+            desc1_src = desc1_src[0]
+            desc1_warp = desc1_warp[0]
+
+            repeatability01 = desc0_src.new_zeros((len(ids0),))
+            repeatability10 = desc1_warp.new_zeros((len(ids1),))
+
+            valid_desc01 = mask0_src[0] & mask0_warp[0]
+            if torch.any(valid_desc01):
+                sim = F.cosine_similarity(desc0_src[valid_desc01], desc0_warp[valid_desc01], dim=-1)
+                repeatability = ((sim + 1.0) * 0.5).clamp(0.0, 1.0)
+                repeatability01[valid_desc01] = repeatability
+
+            valid_desc10 = mask1_src[0] & mask1_warp[0]
+            if torch.any(valid_desc10):
+                sim = F.cosine_similarity(desc1_src[valid_desc10], desc1_warp[valid_desc10], dim=-1)
+                repeatability = ((sim + 1.0) * 0.5).clamp(0.0, 1.0)
+                repeatability10[valid_desc10] = repeatability
+        else:
+            descriptor_map0 = F.normalize(pred0['descriptor_map'][idx].detach(), dim=0)
+            descriptor_map1 = F.normalize(pred1['descriptor_map'][idx].detach(), dim=0)
+
+            desc0_valid = torch.nn.functional.grid_sample(
+                descriptor_map0.unsqueeze(0),
+                valid_kpts0.view(1, 1, -1, 2),
+                mode='bilinear',
+                align_corners=True,
+            )[0, :, 0, :].t()
+            desc1_valid = torch.nn.functional.grid_sample(
+                descriptor_map1.unsqueeze(0),
+                valid_kpts1.view(1, 1, -1, 2),
+                mode='bilinear',
+                align_corners=True,
+            )[0, :, 0, :].t()
+            desc0_valid = F.normalize(desc0_valid, dim=-1)
+            desc1_valid = F.normalize(desc1_valid, dim=-1)
+
+            repeatability01 = compute_repeatability(
+                desc0_valid,
+                descriptor_map1,
+                kpts01_wh,
+                pmf_temperature=score_map_temperature,
+                chunk_size=similarity_chunk_size,
+            )
+            repeatability10 = compute_repeatability(
+                desc1_valid,
+                descriptor_map0,
+                kpts10_wh,
+                pmf_temperature=score_map_temperature,
+                chunk_size=similarity_chunk_size,
+            )
 
         kpts01 = 2 * kpts01_wh.detach() / wh - 1  # N0x2, (x,y), [-1,1]
         kpts10 = 2 * kpts10_wh.detach() / wh - 1  # N0x2, (x,y), [-1,1]

@@ -175,19 +175,19 @@ def interpolate_depth(pos, depth):
     # Valid corners
     i_top_left = torch.floor(i).long()
     j_top_left = torch.floor(j).long()
-    valid_top_left = torch.min(i_top_left >= 0, j_top_left >= 0)
+    valid_top_left = torch.min(torch.min(i_top_left >= 0, i_top_left < h), torch.min(j_top_left >= 0, j_top_left < w))
 
     i_top_right = torch.floor(i).long()
     j_top_right = torch.ceil(j).long()
-    valid_top_right = torch.min(i_top_right >= 0, j_top_right < w)
+    valid_top_right = torch.min(torch.min(i_top_right >= 0, i_top_right < h), torch.min(j_top_right >= 0, j_top_right < w))
 
     i_bottom_left = torch.ceil(i).long()
     j_bottom_left = torch.floor(j).long()
-    valid_bottom_left = torch.min(i_bottom_left < h, j_bottom_left >= 0)
+    valid_bottom_left = torch.min(torch.min(i_bottom_left >= 0, i_bottom_left < h), torch.min(j_bottom_left >= 0, j_bottom_left < w))
 
     i_bottom_right = torch.ceil(i).long()
     j_bottom_right = torch.ceil(j).long()
-    valid_bottom_right = torch.min(i_bottom_right < h, j_bottom_right < w)
+    valid_bottom_right = torch.min(torch.min(i_bottom_right >= 0, i_bottom_right < h), torch.min(j_bottom_right >= 0, j_bottom_right < w))
 
     valid_corners = torch.min(torch.min(valid_top_left, valid_top_right),
                               torch.min(valid_bottom_left, valid_bottom_right))

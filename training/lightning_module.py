@@ -430,6 +430,7 @@ class RDDLightningModule(pl.LightningModule):
             pred1,
             batch,
             score_map_temperature=self.detector_loss.temperature,
+            use_canonical_descriptor=self.model.descriptor.use_canonical_descriptor,
             debug=False,
         )
 
@@ -473,6 +474,7 @@ class RDDLightningModule(pl.LightningModule):
             pred1,
             batch,
             score_map_temperature=self.detector_loss.temperature,
+            use_canonical_descriptor=self.model.descriptor.use_canonical_descriptor,
             debug=False,
         )
 
