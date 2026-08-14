@@ -97,6 +97,7 @@ class RDDLightningModule(pl.LightningModule):
         self.use_canonical_descriptor = bool(descriptor_cfg.get('use_canonical_descriptor', False))
         self.lambda_geo = float(model_config.get('lambda_geo', 0.01))
         self.jacobian_epsilon = float(descriptor_cfg.get('geometry_jacobian_eps', 1.0))
+        self.geometry_start_epoch = int(descriptor_cfg.get('geometry_start_epoch', 5))
 
         self.best_auc10 = 0.0
         self._skip_first_epoch_benchmark = True
@@ -151,11 +152,12 @@ class RDDLightningModule(pl.LightningModule):
 
     # Training ----------------------------------------------------------------------
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
+        use_geometry = self.use_canonical_descriptor and self.current_epoch >= self.geometry_start_epoch
         if self.joint_training:
-            return self._joint_training_step(batch, batch_idx)
+            return self._joint_training_step(batch, batch_idx, use_geometry=use_geometry)
         if self.stage == "detector":
             return self._detector_training_step(batch, batch_idx)
-        return self._descriptor_training_step(batch, batch_idx)
+        return self._descriptor_training_step(batch, batch_idx, use_geometry=use_geometry)
 
     def _compute_descriptor_loss_from_outputs(
         self,
@@ -164,6 +166,8 @@ class RDDLightningModule(pl.LightningModule):
         feats1: torch.Tensor,
         hmap0: torch.Tensor,
         hmap1: torch.Tensor,
+        *,
+        use_geometry: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, float, float, torch.Tensor, Dict[str, float], Dict[str, float]]:
         positives_md_coarse = self.warper.spvs_coarse(batch, getattr(self.model, "stride", 4))
 
@@ -219,7 +223,7 @@ class RDDLightningModule(pl.LightningModule):
             geo_debug["geo_kp_x_max"] = max(geo_debug["geo_kp_x_max"], float(torch.max(pts1[:, 0]).detach().cpu()))
             geo_debug["geo_kp_y_min"] = min(geo_debug["geo_kp_y_min"], float(torch.min(pts1[:, 1]).detach().cpu()))
             geo_debug["geo_kp_y_max"] = max(geo_debug["geo_kp_y_max"], float(torch.max(pts1[:, 1]).detach().cpu()))
-            if self.use_canonical_descriptor:
+            if use_geometry:
                 center_valid = (
                     (pts1[:, 0] >= canonical_radius)
                     & (pts1[:, 0] <= (feat_w - 1.0 - canonical_radius))
@@ -231,7 +235,7 @@ class RDDLightningModule(pl.LightningModule):
             h1 = hmap0[idx]
             h2 = hmap1[idx]
 
-            if self.use_canonical_descriptor:
+            if use_geometry:
                 d0, A0, mask0, _, _ = self.model.descriptor.canonical_descriptors_from_features(
                     feats0[idx:idx + 1],
                     pts1[None],
@@ -441,7 +445,7 @@ class RDDLightningModule(pl.LightningModule):
 
         return loss
 
-    def _joint_training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
+    def _joint_training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int, *, use_geometry: bool):
         feats0, scores_map0, hmap0 = self.model(batch["image0"])
         feats1, scores_map1, hmap1 = self.model(batch["image1"])
 
@@ -451,6 +455,7 @@ class RDDLightningModule(pl.LightningModule):
             feats1,
             hmap0,
             hmap1,
+            use_geometry=use_geometry,
         )
 
         pred0 = {
@@ -495,7 +500,7 @@ class RDDLightningModule(pl.LightningModule):
 
         return loss
 
-    def _descriptor_training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
+    def _descriptor_training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int, *, use_geometry: bool):
         feats1, _, hmap1 = self.model(batch["image0"])
         feats2, _, hmap2 = self.model(batch["image1"])
         loss, loss_ds, loss_h, acc_coarse, acc_kp, match_counts, geo_loss, geo_stats, geo_debug = self._compute_descriptor_loss_from_outputs(
@@ -504,6 +509,7 @@ class RDDLightningModule(pl.LightningModule):
             feats2,
             hmap1,
             hmap2,
+            use_geometry=use_geometry,
         )
 
         total_loss = loss + self.lambda_geo * geo_loss
