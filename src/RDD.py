@@ -42,16 +42,19 @@ class RDD(nn.Module):
         self.set_softdetect(self.top_k, self.detection_threshold)
         super().eval()
         
-    def forward(self, samples: NestedTensor, detector_only: bool = False):
+    def forward(self, samples: NestedTensor, detector_only: bool = False, return_probabilistic: bool = False):
         
         if not isinstance(samples, NestedTensor):
             samples = nested_tensor_from_tensor_list(samples)
 
         if getattr(self.detector, 'uses_descriptor_features', False):
-            feats, matchibility = self.descriptor(samples)
+            descriptor_outputs = self.descriptor(samples)
+            feats, matchibility = descriptor_outputs[:2]
             scoremap = self.detector(feats, samples.tensors.shape[-2:])
             if detector_only:
                 return scoremap
+            if return_probabilistic:
+                return feats, scoremap, matchibility, *descriptor_outputs[2:]
             return feats, scoremap, matchibility
 
         scoremap = self.detector(samples)
@@ -59,8 +62,10 @@ class RDD(nn.Module):
         if detector_only:
             return scoremap
 
-        feats, matchibility = self.descriptor(samples)
-        
+        descriptor_outputs = self.descriptor(samples)
+        feats, matchibility = descriptor_outputs[:2]
+        if return_probabilistic:
+            return feats, scoremap, matchibility, *descriptor_outputs[2:]
         return feats, scoremap, matchibility
     
     def set_softdetect(self, top_k=4096, scores_th=0.01):
@@ -118,7 +123,7 @@ class RDD(nn.Module):
         else:
             raise ValueError('Unknown model')
     
-        M1, _ = self.descriptor(x)
+        M1 = self.descriptor(x)[0]
         M1 = F.normalize(M1, dim=1)
         
         if mkpts.shape[1] > self.top_k:

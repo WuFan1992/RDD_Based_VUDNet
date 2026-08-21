@@ -1,7 +1,16 @@
 RDD:
   DESCRIPTOR:
-    BACKBONE: mobilenet_v3_large
+    BACKBONE: resnet_50
     USE_22K: false
-    USE_DEFORMABLE_TRANSFORMER: true
+    USE_DEFORMABLE_TRANSFORMER: false
+    DESCRIPTOR_STAGE: 1
+    LOGVAR_MIN: -6.0
+    LOGVAR_MAX: 6.0
+    LAMBDA_SIGMA: 0.01
+    LAMBDA_REC: 1.0
     NUM_FEATURE_LEVELS: 5
     PRETRAIN_BACKBONE: true
+  DETECTOR:
+    TYPE: shared_descriptor
+    INPUT_DIM: 256
+    UPSAMPLE_DIMS: [128, 64]

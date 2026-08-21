@@ -17,7 +17,7 @@ from src.utils.misc import lower_config
 
 
 """
-python training/train.py --ckpt_save_path /checkpoints/ --megadepth_root_path /datasets/ --batch_size 1 
+python -m training.train --ckpt_save_path checkpoints/ --megadepth_root_path datasets/ --batch_size 1   
 """
 
 

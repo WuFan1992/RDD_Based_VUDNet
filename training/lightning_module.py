@@ -96,7 +96,13 @@ class RDDLightningModule(pl.LightningModule):
         self.best_auc10 = 0.0
         self._skip_first_epoch_benchmark = True
         self.detector_loss = DetectorLoss(temperature=0.1, scores_th=0.1) if stage == "detector" else None
-        self.descriptor_loss = DescriptorLoss(inv_temp=20) if stage == "descriptor" or self.joint_training else None
+        descriptor_config = model_config.get("descriptor", model_config)
+        self.descriptor_loss = DescriptorLoss(
+            inv_temp=20,
+            stage=int(descriptor_config.get("descriptor_stage", 1)),
+            sigma_weight=float(descriptor_config.get("lambda_sigma", 0.01)),
+            reconstruction_weight=float(descriptor_config.get("lambda_rec", 1.0)),
+        ) if stage == "descriptor" or self.joint_training else None
         self.warper = warper if stage == "descriptor" or self.joint_training else None
         self.validation_helper: Optional[RDD_helper] = None
         self.n_vals_plot = 32
@@ -157,6 +163,12 @@ class RDDLightningModule(pl.LightningModule):
         feats1: torch.Tensor,
         hmap0: torch.Tensor,
         hmap1: torch.Tensor,
+        logvar0: Optional[torch.Tensor] = None,
+        logvar1: Optional[torch.Tensor] = None,
+        reconstruction0: Optional[torch.Tensor] = None,
+        reconstruction1: Optional[torch.Tensor] = None,
+        backbone_feature0: Optional[torch.Tensor] = None,
+        backbone_feature1: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, float, float, float]:
         positives_md_coarse = self.warper.spvs_coarse(batch, getattr(self.model, "stride", 4))
 
@@ -180,8 +192,16 @@ class RDDLightningModule(pl.LightningModule):
 
             m1 = feats0[idx, :, pts1[:, 1], pts1[:, 0]].permute(1, 0)
             m2 = feats1[idx, :, pts2[:, 1], pts2[:, 0]].permute(1, 0)
+            lv1 = logvar0[idx, :, pts1[:, 1], pts1[:, 0]].permute(1, 0) if logvar0 is not None else None
+            lv2 = logvar1[idx, :, pts2[:, 1], pts2[:, 0]].permute(1, 0) if logvar1 is not None else None
+            rec_loss = None
+            if reconstruction0 is not None and reconstruction1 is not None:
+                rec_loss = 0.5 * (
+                    F.mse_loss(reconstruction0[idx], backbone_feature0[idx])
+                    + F.mse_loss(reconstruction1[idx], backbone_feature1[idx])
+                )
 
-            loss_ds, loss_h, acc_kp = self.descriptor_loss(m1, m2, h1, h2, pts1, pts2)
+            loss_ds, loss_h, acc_kp = self.descriptor_loss(m1, m2, h1, h2, pts1, pts2, lv1, lv2, rec_loss)
             loss_items.append(loss_ds + loss_h)
 
             acc_coarse_items.append(check_accuracy(m1, m2))
@@ -291,8 +311,12 @@ class RDDLightningModule(pl.LightningModule):
         return loss
 
     def _joint_training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
-        feats0, scores_map0, hmap0 = self.model(batch["image0"])
-        feats1, scores_map1, hmap1 = self.model(batch["image1"])
+        feats0, scores_map0, hmap0, logvar0, _, reconstruction0, backbone_feature0 = self.model(
+            batch["image0"], return_probabilistic=True
+        )
+        feats1, scores_map1, hmap1, logvar1, _, reconstruction1, backbone_feature1 = self.model(
+            batch["image1"], return_probabilistic=True
+        )
 
         descriptor_loss, acc_coarse, acc_kp, descriptor_matches = self._compute_descriptor_loss_from_outputs(
             batch,
@@ -300,6 +324,12 @@ class RDDLightningModule(pl.LightningModule):
             feats1,
             hmap0,
             hmap1,
+            logvar0,
+            logvar1,
+            reconstruction0,
+            reconstruction1,
+            backbone_feature0,
+            backbone_feature1,
         )
 
         pred0 = {
@@ -338,14 +368,24 @@ class RDDLightningModule(pl.LightningModule):
         return loss
 
     def _descriptor_training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
-        feats1, _, hmap1 = self.model(batch["image0"])
-        feats2, _, hmap2 = self.model(batch["image1"])
+        feats1, _, hmap1, logvar1, _, reconstruction1, backbone_feature1 = self.model(
+            batch["image0"], return_probabilistic=True
+        )
+        feats2, _, hmap2, logvar2, _, reconstruction2, backbone_feature2 = self.model(
+            batch["image1"], return_probabilistic=True
+        )
         loss, acc_coarse, acc_kp, match_counts = self._compute_descriptor_loss_from_outputs(
             batch,
             feats1,
             feats2,
             hmap1,
             hmap2,
+            logvar1,
+            logvar2,
+            reconstruction1,
+            reconstruction2,
+            backbone_feature1,
+            backbone_feature2,
         )
 
         self._plot_training_matches(batch, use_model_detector=False)
