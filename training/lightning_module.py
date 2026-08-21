@@ -92,6 +92,13 @@ class RDDLightningModule(pl.LightningModule):
             for param in self.model.detector.parameters():
                 param.requires_grad = False
         self.stage = stage
+        descriptor_cfg = config["rdd"].get("descriptor", {})
+        self.loss_w_equivariant = float(descriptor_cfg.get("loss_w_equivariant", 0.2))
+        self.loss_w_disentangle = float(descriptor_cfg.get("loss_w_disentangle", 0.02))
+        self.loss_w_inv_align = float(descriptor_cfg.get("loss_w_inv_align", 0.2))
+        self.loss_w_inv_diverse = float(descriptor_cfg.get("loss_w_inv_diverse", 0.1))
+        self.inv_neg_margin = float(descriptor_cfg.get("inv_neg_margin", 0.6))
+        self.max_train_matches = int(descriptor_cfg.get("max_train_matches", 2048))
 
         self.best_auc10 = 0.0
         self._skip_first_epoch_benchmark = True
@@ -256,6 +263,95 @@ class RDDLightningModule(pl.LightningModule):
 
                 close_figures(figures)
 
+    def _compute_disentangled_losses(
+        self,
+        batch: Dict[str, torch.Tensor],
+        invariant0: torch.Tensor,
+        invariant1: torch.Tensor,
+        equivariant0: torch.Tensor,
+        equivariant1: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        positives_md_coarse = self.warper.spvs_coarse(batch, getattr(self.model, "stride", 4))
+
+        inv_align_terms = []
+        inv_diverse_terms = []
+        eq_terms = []
+        disentangle_terms = []
+
+        for idx, positives in enumerate(positives_md_coarse):
+            if positives is None or len(positives) < 16:
+                continue
+
+            if len(positives) > self.max_train_matches:
+                perm = torch.randperm(len(positives), device=positives.device)
+                positives = positives[perm[: self.max_train_matches]]
+
+            pts0 = positives[:, :2].long()
+            pts1 = positives[:, 2:].long()
+
+            inv0 = invariant0[idx, :, pts0[:, 1], pts0[:, 0]].permute(1, 0)
+            inv1 = invariant1[idx, :, pts1[:, 1], pts1[:, 0]].permute(1, 0)
+            eq0 = equivariant0[idx, :, pts0[:, 1], pts0[:, 0]].permute(1, 0)
+            eq1 = equivariant1[idx, :, pts1[:, 1], pts1[:, 0]].permute(1, 0)
+
+            # Invariant branch: matched points should be similar.
+            inv_align = 1.0 - F.cosine_similarity(inv0, inv1, dim=-1).mean()
+            inv_align_terms.append(inv_align)
+
+            # Invariant anti-collapse: the hardest mismatched point must stay
+            # below the positive similarity by a cosine margin.
+            inv0_n = F.normalize(inv0, dim=-1)
+            inv1_n = F.normalize(inv1, dim=-1)
+            similarity = inv0_n @ inv1_n.transpose(0, 1)
+            positive_similarity = similarity.diagonal()
+            negative_similarity = similarity.masked_fill(
+                torch.eye(similarity.shape[0], device=similarity.device, dtype=torch.bool),
+                float('-inf'),
+            ).max(dim=-1).values
+            inv_diverse = F.relu(
+                self.inv_neg_margin + negative_similarity - positive_similarity
+            ).mean()
+            inv_diverse_terms.append(inv_diverse)
+
+            # Equivariant branch: match should transform with relative pose.
+            ones0 = torch.ones((eq0.shape[0], 1), device=eq0.device, dtype=eq0.dtype)
+            ones1 = torch.ones((eq1.shape[0], 1), device=eq1.device, dtype=eq1.dtype)
+            eq0_h = torch.cat([eq0, ones0], dim=-1)
+            eq1_h = torch.cat([eq1, ones1], dim=-1)
+
+            pose01 = batch['warp01_params']['pose01'][idx].to(device=eq0.device, dtype=eq0.dtype)
+            pose10 = batch['warp10_params']['pose01'][idx].to(device=eq0.device, dtype=eq0.dtype)
+            eq1_pred = (eq0_h @ pose01.transpose(0, 1))[:, :eq1.shape[1]]
+            eq0_pred = (eq1_h @ pose10.transpose(0, 1))[:, :eq0.shape[1]]
+            eq_terms.append(F.smooth_l1_loss(eq1_pred, eq1) + F.smooth_l1_loss(eq0_pred, eq0))
+
+            # Disentanglement: center and standardize each branch before
+            # penalizing cross-correlation. Use Frobenius norm rather than a
+            # mean over all channel pairs so the loss remains observable.
+            def cross_correlation_loss(invariant, equivariant):
+                invariant = invariant - invariant.mean(dim=0, keepdim=True)
+                equivariant = equivariant - equivariant.mean(dim=0, keepdim=True)
+                invariant = invariant / invariant.std(dim=0, keepdim=True, unbiased=False).clamp_min(1e-4)
+                equivariant = equivariant / equivariant.std(dim=0, keepdim=True, unbiased=False).clamp_min(1e-4)
+                correlation = invariant.transpose(0, 1) @ equivariant
+                correlation = correlation / max(invariant.shape[0], 1)
+                return correlation.pow(2).sum()
+
+            disentangle_terms.append(0.5 * (
+                cross_correlation_loss(inv0, eq0) +
+                cross_correlation_loss(inv1, eq1)
+            ))
+
+        zero = invariant0.sum() * 0.0
+        if not inv_align_terms:
+            return zero, zero, zero, zero
+
+        inv_align_loss = torch.stack(inv_align_terms).mean()
+        inv_diverse_loss = torch.stack(inv_diverse_terms).mean()
+        equivariant_loss = torch.stack(eq_terms).mean()
+        disentangle_loss = torch.stack(disentangle_terms).mean()
+        return inv_align_loss, inv_diverse_loss, equivariant_loss, disentangle_loss
+
     def _detector_training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
         feats0, scores_map0, _ = self.model(batch["image0"])
         feats1, scores_map1, _ = self.model(batch["image1"])
@@ -338,19 +434,41 @@ class RDDLightningModule(pl.LightningModule):
         return loss
 
     def _descriptor_training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
-        feats1, _, hmap1 = self.model(batch["image0"])
-        feats2, _, hmap2 = self.model(batch["image1"])
-        loss, acc_coarse, acc_kp, match_counts = self._compute_descriptor_loss_from_outputs(
+        invariant1, hmap1, aux1 = self.model.descriptor(batch["image0"], return_branches=True)
+        invariant2, hmap2, aux2 = self.model.descriptor(batch["image1"], return_branches=True)
+
+        descriptor_loss, acc_coarse, acc_kp, match_counts = self._compute_descriptor_loss_from_outputs(
             batch,
-            feats1,
-            feats2,
+            invariant1,
+            invariant2,
             hmap1,
             hmap2,
+        )
+
+        inv_align_loss, inv_diverse_loss, equivariant_loss, disentangle_loss = self._compute_disentangled_losses(
+            batch,
+            invariant1,
+            invariant2,
+            aux1['equivariant_map'],
+            aux2['equivariant_map'],
+        )
+
+        loss = (
+            descriptor_loss
+            + self.loss_w_inv_align * inv_align_loss
+            + self.loss_w_inv_diverse * inv_diverse_loss
+            + self.loss_w_equivariant * equivariant_loss
+            + self.loss_w_disentangle * disentangle_loss
         )
 
         self._plot_training_matches(batch, use_model_detector=False)
 
         self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/loss_descriptor", descriptor_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/loss_inv_align", inv_align_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/loss_inv_diverse", inv_diverse_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/loss_equivariant", equivariant_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/loss_disentangle", disentangle_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/lr", self.trainer.optimizers[0].param_groups[0]['lr'], prog_bar=False, on_step=True, on_epoch=False, sync_dist=True)
         self.log("train/acc_coarse", acc_coarse, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/acc_kp", acc_kp, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)

@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from ..utils.misc import NestedTensor, nested_tensor_from_tensor_list
 from .backbone import build_backbone
-from .deformable_transformer import build_deformable_transformer
 
 class BasicLayer(nn.Module):
 	"""
@@ -21,12 +20,17 @@ class BasicLayer(nn.Module):
 	  return self.layer(x)
 
 class RDD_Descriptor(nn.Module):
-    def __init__(self, backbone, hidden_dim, num_feature_levels, transformer=None):
+    def __init__(self, backbone, hidden_dim, num_feature_levels, invariant_dim=None, equivariant_dim=3):
         super().__init__()
-        self.transformer = transformer
         self.hidden_dim = hidden_dim
         self.num_feature_levels = num_feature_levels
-        self.use_deformable_transformer = transformer is not None
+        self.invariant_dim = hidden_dim if invariant_dim is None else invariant_dim
+        self.equivariant_dim = equivariant_dim
+
+        if self.invariant_dim != self.hidden_dim:
+            raise ValueError('invariant_dim must match hidden_dim to keep detector interface unchanged.')
+        if self.equivariant_dim != 3:
+            raise ValueError('equivariant_dim must be 3 to apply SE(3) pose constraints in training.')
 
         matchibility_hidden_dim = max(self.hidden_dim // 2, 64)
         matchibility_low_dim = max(matchibility_hidden_dim // 2, 32)
@@ -37,6 +41,15 @@ class RDD_Descriptor(nn.Module):
 										nn.Conv2d(matchibility_low_dim, 1, 1),
 										nn.Sigmoid()
 									)
+
+        self.invariant_head = nn.Sequential(
+                                        BasicLayer(self.hidden_dim, self.hidden_dim, 3, padding=1),
+                                        nn.Conv2d(self.hidden_dim, self.invariant_dim, 1),
+                                    )
+        self.equivariant_head = nn.Sequential(
+                                        BasicLayer(self.hidden_dim, self.hidden_dim // 2, 3, padding=1),
+                                        nn.Conv2d(self.hidden_dim // 2, self.equivariant_dim, 1),
+                                    )
 
         if num_feature_levels > 1:
             num_backbone_outs = len(backbone.strides)
@@ -66,7 +79,7 @@ class RDD_Descriptor(nn.Module):
             nn.init.xavier_uniform_(proj[0].weight, gain=1)
             nn.init.constant_(proj[0].bias, 0)
             
-    def forward(self, samples: NestedTensor):
+    def forward(self, samples: NestedTensor, return_branches: bool = False):
         
         if not isinstance(samples, NestedTensor):
             samples = nested_tensor_from_tensor_list(samples)
@@ -97,38 +110,28 @@ class RDD_Descriptor(nn.Module):
                 masks.append(mask)
                 pos.append(pos_l)
         
-        if self.use_deformable_transformer:
-            flatten_feats, spatial_shapes, level_start_index = self.transformer(srcs, masks, pos)
-            feats = []
-            level_start_index = torch.cat((
-                level_start_index,
-                torch.tensor([flatten_feats.shape[1]], device=level_start_index.device),
-            ))
-            for i, shape in enumerate(spatial_shapes):
-                assert len(shape) == 2
-                temp = flatten_feats[:, level_start_index[i]: level_start_index[i + 1], :]
-                feats.append(temp.transpose(1, 2).view(-1, self.hidden_dim, *shape))
-        else:
-            # ConvNeXt-only baseline: use projected backbone features directly.
-            feats = srcs
+        feats = srcs
 
         final_feature = feats[0]
         for feat in feats[1:]:
             final_feature = final_feature + F.interpolate(feat, size=final_feature.shape[-2:], mode='bilinear', align_corners=False)
         
-        matchibility = self.matchibility_head(final_feature)
-        
-        return final_feature, matchibility
+        invariant_map = self.invariant_head(final_feature)
+        equivariant_map = self.equivariant_head(final_feature)
+        matchibility = self.matchibility_head(invariant_map)
+
+        if return_branches:
+            return invariant_map, matchibility, {'equivariant_map': equivariant_map}
+
+        return invariant_map, matchibility
     
     
 def build_descriptor(config):
     backbone = build_backbone(config)
-    transformer = None
-    if config.get('use_deformable_transformer', True):
-        transformer = build_deformable_transformer(config)
     return RDD_Descriptor(
         backbone,
         hidden_dim=config['d_model'],
         num_feature_levels=config['num_feature_levels'],
-        transformer=transformer,
+        invariant_dim=config.get('invariant_dim', config['d_model']),
+        equivariant_dim=config.get('equivariant_dim', 3),
     )
