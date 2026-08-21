@@ -34,13 +34,20 @@ class RDD_Descriptor(nn.Module):
 
         matchibility_hidden_dim = max(self.hidden_dim // 2, 64)
         matchibility_low_dim = max(matchibility_hidden_dim // 2, 32)
-        
+
+        # Shared encoder keeps the strong descriptor signal that the original RDD had.
+        # We only use the split branch as a residual refinement, not as the entire descriptor.
+        self.shared_head = nn.Sequential(
+            BasicLayer(self.hidden_dim, self.hidden_dim, 3, padding=1),
+            nn.Conv2d(self.hidden_dim, self.hidden_dim, 1),
+        )
+
         self.matchibility_head = nn.Sequential(
-										BasicLayer(self.hidden_dim, matchibility_hidden_dim, 1, padding=0),
-										BasicLayer(matchibility_hidden_dim, matchibility_low_dim, 1, padding=0),
-										nn.Conv2d(matchibility_low_dim, 1, 1),
-										nn.Sigmoid()
-									)
+                                        BasicLayer(self.hidden_dim, matchibility_hidden_dim, 1, padding=0),
+                                        BasicLayer(matchibility_hidden_dim, matchibility_low_dim, 1, padding=0),
+                                        nn.Conv2d(matchibility_low_dim, 1, 1),
+                                        nn.Sigmoid()
+                                    )
 
         self.invariant_head = nn.Sequential(
                                         BasicLayer(self.hidden_dim, self.hidden_dim, 3, padding=1),
@@ -50,6 +57,11 @@ class RDD_Descriptor(nn.Module):
                                         BasicLayer(self.hidden_dim, self.hidden_dim // 2, 3, padding=1),
                                         nn.Conv2d(self.hidden_dim // 2, self.equivariant_dim, 1),
                                     )
+        self.gate_head = nn.Sequential(
+            BasicLayer(self.hidden_dim, self.hidden_dim // 2, 3, padding=1),
+            nn.Conv2d(self.hidden_dim // 2, 1, 1),
+            nn.Sigmoid(),
+        )
 
         if num_feature_levels > 1:
             num_backbone_outs = len(backbone.strides)
@@ -115,15 +127,26 @@ class RDD_Descriptor(nn.Module):
         final_feature = feats[0]
         for feat in feats[1:]:
             final_feature = final_feature + F.interpolate(feat, size=final_feature.shape[-2:], mode='bilinear', align_corners=False)
-        
+
+        shared_map = self.shared_head(final_feature)
         invariant_map = self.invariant_head(final_feature)
         equivariant_map = self.equivariant_head(final_feature)
-        matchibility = self.matchibility_head(invariant_map)
+        gate = self.gate_head(final_feature)
+
+        # Residual split: keep a strong shared descriptor and let the invariant branch act as a
+        # learned correction / modulation, instead of replacing the main descriptor.
+        descriptor_map = shared_map + gate * invariant_map
+        matchibility = self.matchibility_head(descriptor_map)
 
         if return_branches:
-            return invariant_map, matchibility, {'equivariant_map': equivariant_map}
+            return descriptor_map, matchibility, {
+                'equivariant_map': equivariant_map,
+                'invariant_map': invariant_map,
+                'shared_map': shared_map,
+                'gate': gate,
+            }
 
-        return invariant_map, matchibility
+        return descriptor_map, matchibility
     
     
 def build_descriptor(config):
