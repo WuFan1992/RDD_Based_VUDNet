@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional
 import pytorch_lightning as pl
 import torch
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.strategies import DDPStrategy
 import math
@@ -73,6 +73,14 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument('--descriptor_epochs', type=int, default=20, help='Number of descriptor training epochs.')
     parser.add_argument('--detector_epochs', type=int, default=20, help='Number of detector training epochs.')
+    parser.add_argument('--detector_lr_scale', type=float, default=0.1,
+                        help='Scale factor applied to base learning rate during detector-only training.')
+    parser.add_argument('--detector_epoch_scale', type=float, default=0.5,
+                        help='Scale factor applied to detector_epochs during detector-only training.')
+    parser.add_argument('--detector_early_stop_patience', type=int, default=5,
+                        help='Early stopping patience on auc@10 for detector-only training. Set <=0 to disable.')
+    parser.add_argument('--detector_early_stop_min_delta', type=float, default=5e-4,
+                        help='Minimum auc@10 improvement to reset detector early-stopping patience.')
 
     parser.add_argument('--seed', type=int, default=0, help='Random seed.')
     parser.add_argument('--accelerator', type=str, default='auto', help='Lightning accelerator (e.g. auto, gpu).')
@@ -269,9 +277,10 @@ def main() -> None:
         if init_weights is None and not joint_training:
             raise ValueError("Detector stage requested but no descriptor weights were provided. "
                              "Train the descriptor stage first or pass --detector_from <ckpt>.")
+        detector_lr = true_lr if joint_training else (true_lr * args.detector_lr_scale)
         detector_module = RDDLightningModule(
             stage='detector',
-            lr=true_lr,
+            lr=detector_lr,
             lr_step_size=args.lr_step_size,
             milestones=args.milestones,
             gamma_steplr=args.gamma_steplr,
@@ -298,10 +307,23 @@ def main() -> None:
         )
         detector_stage_name = 'joint' if joint_training else 'detector'
         detector_logger, detector_checkpoint = build_stage_logger_and_checkpoint(ckpt_root, detector_stage_name)
+        detector_callbacks = [detector_checkpoint, ResampleDataCallback()]
+        if (not joint_training) and args.detector_early_stop_patience > 0:
+            detector_callbacks.append(
+                EarlyStopping(
+                    monitor='auc@10',
+                    mode='max',
+                    patience=args.detector_early_stop_patience,
+                    min_delta=args.detector_early_stop_min_delta,
+                    verbose=True,
+                )
+            )
+
+        detector_max_epochs = args.descriptor_epochs if joint_training else max(1, int(math.ceil(args.detector_epochs * args.detector_epoch_scale)))
         detector_trainer_kwargs = dict(
-            max_epochs=args.descriptor_epochs if joint_training else args.detector_epochs,
+            max_epochs=detector_max_epochs,
             default_root_dir=detector_logger.log_dir,
-            callbacks=[detector_checkpoint, ResampleDataCallback()],
+            callbacks=detector_callbacks,
             logger=detector_logger,
             check_val_every_n_epoch=1,
             **trainer_kwargs,

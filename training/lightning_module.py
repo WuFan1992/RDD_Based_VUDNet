@@ -102,7 +102,10 @@ class RDDLightningModule(pl.LightningModule):
             stage=int(descriptor_config.get("descriptor_stage", 1)),
             sigma_weight=float(descriptor_config.get("lambda_sigma", 0.01)),
             reconstruction_weight=float(descriptor_config.get("lambda_rec", 1.0)),
+            probabilistic_normalize_mu=bool(descriptor_config.get("probabilistic_normalize_mu", True)),
+            probabilistic_chunk_size=int(descriptor_config.get("probabilistic_chunk_size", 64)),
         ) if stage == "descriptor" or self.joint_training else None
+        self.probabilistic_max_pairs = int(descriptor_config.get("probabilistic_max_pairs", 2048))
         self.warper = warper if stage == "descriptor" or self.joint_training else None
         self.validation_helper: Optional[RDD_helper] = None
         self.n_vals_plot = 32
@@ -169,20 +172,31 @@ class RDDLightningModule(pl.LightningModule):
         reconstruction1: Optional[torch.Tensor] = None,
         backbone_feature0: Optional[torch.Tensor] = None,
         backbone_feature1: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, float, float, float]:
+    ) -> tuple[torch.Tensor, float, float, float, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
         positives_md_coarse = self.warper.spvs_coarse(batch, getattr(self.model, "stride", 4))
 
         loss_items = []
         acc_coarse_items: List[float] = []
         acc_kp_items: List[float] = []
         match_counts = 0
+        match_loss_items = []
+        sigma_loss_items = []
+        reconstruction_loss_items = []
+        raw_sigma_items = []
+        #pair_counts_before = []
+        #pair_counts_after = []
 
         for idx, positives in enumerate(positives_md_coarse):
             if positives is None or len(positives) < 30:
                 continue
+            #pair_counts_before.append(float(len(positives)))
             if len(positives) > 10000:
                 perm = torch.randperm(len(positives), device=positives.device)
                 positives = positives[perm[:10000]]
+            #if self.descriptor_loss.stage >= 2 and len(positives) > self.probabilistic_max_pairs:
+            #    perm = torch.randperm(len(positives), device=positives.device)
+            #    positives = positives[perm[:self.probabilistic_max_pairs]]
+            #pair_counts_after.append(float(len(positives)))
 
             pts1 = positives[:, :2].long()
             pts2 = positives[:, 2:].long()
@@ -201,8 +215,14 @@ class RDDLightningModule(pl.LightningModule):
                     + F.mse_loss(reconstruction1[idx], backbone_feature1[idx])
                 )
 
-            loss_ds, loss_h, acc_kp = self.descriptor_loss(m1, m2, h1, h2, pts1, pts2, lv1, lv2, rec_loss)
+            loss_ds, loss_h, acc_kp, match_loss, sigma_loss, reconstruction_loss, raw_sigma = self.descriptor_loss(
+                m1, m2, h1, h2, pts1, pts2, lv1, lv2, rec_loss
+            )
             loss_items.append(loss_ds + loss_h)
+            match_loss_items.append(match_loss)
+            sigma_loss_items.append(sigma_loss)
+            reconstruction_loss_items.append(reconstruction_loss)
+            raw_sigma_items.append(raw_sigma)
 
             acc_coarse_items.append(check_accuracy(m1, m2))
             acc_kp_items.append(acc_kp)
@@ -211,12 +231,24 @@ class RDDLightningModule(pl.LightningModule):
         match_counts /= max(1, len(batch["image0"]))
         if not loss_items:
             zero = (feats0.sum() + feats1.sum() + hmap0.sum() + hmap1.sum()) * 0.0
-            return zero, 0.0, 0.0, float(match_counts)
+            zero_scalar = feats0.new_zeros(())
+            return zero, 0.0, 0.0, float(match_counts), zero_scalar, zero_scalar, zero_scalar, zero_scalar, 0.0, 0.0
 
         loss = torch.stack(loss_items).mean()
         acc_coarse = sum(acc_coarse_items) / len(acc_coarse_items)
         acc_kp = sum(acc_kp_items) / len(acc_kp_items)
-        return loss, acc_coarse, acc_kp, float(match_counts)
+        return (
+            loss,
+            acc_coarse,
+            acc_kp,
+            float(match_counts),
+            torch.stack(match_loss_items).mean(),
+            torch.stack(sigma_loss_items).mean(),
+            torch.stack(reconstruction_loss_items).mean(),
+            torch.stack(raw_sigma_items).mean(),
+            sum(pair_counts_before) / max(1, len(pair_counts_before)),
+            sum(pair_counts_after) / max(1, len(pair_counts_after)),
+        )
 
     def _plot_training_matches(self, batch: Dict[str, torch.Tensor], *, use_model_detector: bool) -> None:
         plots_every = self.hparams.plots_every
@@ -318,7 +350,7 @@ class RDDLightningModule(pl.LightningModule):
             batch["image1"], return_probabilistic=True
         )
 
-        descriptor_loss, acc_coarse, acc_kp, descriptor_matches = self._compute_descriptor_loss_from_outputs(
+        descriptor_loss, acc_coarse, acc_kp, descriptor_matches, match_loss, sigma_loss, reconstruction_loss, raw_sigma, pairs_before, pairs_after = self._compute_descriptor_loss_from_outputs(
             batch,
             feats0,
             feats1,
@@ -357,6 +389,25 @@ class RDDLightningModule(pl.LightningModule):
         self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/loss_descriptor", descriptor_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/loss_detector", detector_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/loss_match", match_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/loss_sigma", sigma_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/loss_sigma_raw", raw_sigma, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/loss_reconstruction", reconstruction_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/probabilistic_pairs_before", pairs_before, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/probabilistic_pairs_after", pairs_after, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/lambda_sigma", float(self.descriptor_loss.sigma_weight), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train/probabilistic_normalize_mu", float(self.descriptor_loss.probabilistic_normalize_mu), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train/probabilistic_chunk_size", float(self.descriptor_loss.probabilistic_chunk_size), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train/probabilistic_max_pairs", float(self.probabilistic_max_pairs), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train/logvar_mean", logvar0.mean().detach(), prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/logvar_min", logvar0.detach().amin(), prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/logvar_max", logvar0.detach().amax(), prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/variance_mean", logvar0.detach().exp().mean(), prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        descriptor_model = self.model.module.descriptor if hasattr(self.model, "module") else self.model.descriptor
+        low_clip_threshold = descriptor_model.logvar_min + 1e-3
+        high_clip_threshold = descriptor_model.logvar_max - 1e-3
+        self.log("train/logvar_low_clip_ratio", (logvar0.detach() <= low_clip_threshold).float().mean(), prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/logvar_high_clip_ratio", (logvar0.detach() >= high_clip_threshold).float().mean(), prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/lr", self.trainer.optimizers[0].param_groups[0]['lr'], prog_bar=False, on_step=True, on_epoch=False, sync_dist=True)
         self.log("train/acc_coarse", acc_coarse, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/acc_kp", acc_kp, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
@@ -374,7 +425,7 @@ class RDDLightningModule(pl.LightningModule):
         feats2, _, hmap2, logvar2, _, reconstruction2, backbone_feature2 = self.model(
             batch["image1"], return_probabilistic=True
         )
-        loss, acc_coarse, acc_kp, match_counts = self._compute_descriptor_loss_from_outputs(
+        loss, acc_coarse, acc_kp, match_counts, match_loss, sigma_loss, reconstruction_loss, raw_sigma, pairs_before, pairs_after = self._compute_descriptor_loss_from_outputs(
             batch,
             feats1,
             feats2,
@@ -395,6 +446,25 @@ class RDDLightningModule(pl.LightningModule):
         self.log("train/acc_coarse", acc_coarse, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/acc_kp", acc_kp, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/matches", float(match_counts), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train/loss_match", match_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/loss_sigma", sigma_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/loss_sigma_raw", raw_sigma, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/loss_reconstruction", reconstruction_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/probabilistic_pairs_before", pairs_before, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/probabilistic_pairs_after", pairs_after, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/lambda_sigma", float(self.descriptor_loss.sigma_weight), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train/probabilistic_normalize_mu", float(self.descriptor_loss.probabilistic_normalize_mu), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train/probabilistic_chunk_size", float(self.descriptor_loss.probabilistic_chunk_size), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train/probabilistic_max_pairs", float(self.probabilistic_max_pairs), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train/logvar_mean", logvar1.mean().detach(), prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/logvar_min", logvar1.detach().amin(), prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/logvar_max", logvar1.detach().amax(), prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/variance_mean", logvar1.detach().exp().mean(), prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        descriptor_model = self.model.module.descriptor if hasattr(self.model, "module") else self.model.descriptor
+        low_clip_threshold = descriptor_model.logvar_min + 1e-3
+        high_clip_threshold = descriptor_model.logvar_max - 1e-3
+        self.log("train/logvar_low_clip_ratio", (logvar1.detach() <= low_clip_threshold).float().mean(), prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/logvar_high_clip_ratio", (logvar1.detach() >= high_clip_threshold).float().mean(), prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
 
         return loss
 
