@@ -183,20 +183,24 @@ class RDDLightningModule(pl.LightningModule):
         sigma_loss_items = []
         reconstruction_loss_items = []
         raw_sigma_items = []
-        #pair_counts_before = []
-        #pair_counts_after = []
+        pair_counts_before = []
+        pair_counts_after = []
 
         for idx, positives in enumerate(positives_md_coarse):
             if positives is None or len(positives) < 30:
                 continue
-            #pair_counts_before.append(float(len(positives)))
+            pair_counts_before.append(float(len(positives)))
             if len(positives) > 10000:
                 perm = torch.randperm(len(positives), device=positives.device)
                 positives = positives[perm[:10000]]
-            #if self.descriptor_loss.stage >= 2 and len(positives) > self.probabilistic_max_pairs:
-            #    perm = torch.randperm(len(positives), device=positives.device)
-            #    positives = positives[perm[:self.probabilistic_max_pairs]]
-            #pair_counts_after.append(float(len(positives)))
+            if (
+                self.descriptor_loss.stage >= 2
+                and self.probabilistic_max_pairs > 0
+                and len(positives) > self.probabilistic_max_pairs
+            ):
+                perm = torch.randperm(len(positives), device=positives.device)
+                positives = positives[perm[:self.probabilistic_max_pairs]]
+            pair_counts_after.append(float(len(positives)))
 
             pts1 = positives[:, :2].long()
             pts2 = positives[:, 2:].long()
