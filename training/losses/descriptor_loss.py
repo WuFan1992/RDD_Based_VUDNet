@@ -8,7 +8,8 @@ class DescriptorLoss(nn.Module):
     def __init__(self, inv_temp=20, dual_softmax_weight=5, heatmap_weight=1,
                  stage=1, sigma_weight=0.0, reconstruction_weight=0.0,
                  probabilistic_normalize_mu=True,
-                 probabilistic_chunk_size=64):
+                 probabilistic_chunk_size=64,
+                 matching_mode=None):
         super().__init__()
         self.inv_temp = inv_temp
         self.dual_softmax_weight = dual_softmax_weight
@@ -18,10 +19,13 @@ class DescriptorLoss(nn.Module):
         self.reconstruction_weight = reconstruction_weight
         self.probabilistic_normalize_mu = probabilistic_normalize_mu
         self.probabilistic_chunk_size = max(1, int(probabilistic_chunk_size))
+        self.matching_mode = matching_mode or ("probabilistic" if stage >= 2 else "cosine")
+        if self.matching_mode not in {"cosine", "probabilistic"}:
+            raise ValueError("matching_mode must be 'cosine' or 'probabilistic'")
     
     def forward(self, m1, m2, h1, h2, pts1, pts2, logvar1=None, logvar2=None,
                 reconstruction_loss=None):
-        if self.stage >= 2:
+        if self.matching_mode == "probabilistic":
             loss_ds = probabilistic_dual_softmax_loss(
                 m1,
                 m2,
@@ -74,11 +78,13 @@ def probabilistic_dual_softmax_loss(mu1, mu2, logvar1, logvar2, temp=1, normaliz
     row_lse = mu1.new_empty(n)
     diag_logits = mu1.new_empty(n)
     col_lse = mu1.new_full((n,), -torch.inf)
+    
 
     for start in range(0, n, chunk_size):
         end = min(start + chunk_size, n)
         mu1_chunk = mu1[start:end]
         var1_chunk = var1[start:end]
+        
 
         diff = mu1_chunk[:, None, :] - mu2[None, :, :]
         variance_sum = var1_chunk[:, None, :] + var2[None, :, :] + 1e-6

@@ -98,12 +98,13 @@ class RDDLightningModule(pl.LightningModule):
         self.detector_loss = DetectorLoss(temperature=0.1, scores_th=0.1) if stage == "detector" else None
         descriptor_config = model_config.get("descriptor", model_config)
         self.descriptor_loss = DescriptorLoss(
-            inv_temp=20,
+            inv_temp=float(descriptor_config.get("matching_temperature", 20.0)),
             stage=int(descriptor_config.get("descriptor_stage", 1)),
             sigma_weight=float(descriptor_config.get("lambda_sigma", 0.01)),
             reconstruction_weight=float(descriptor_config.get("lambda_rec", 1.0)),
             probabilistic_normalize_mu=bool(descriptor_config.get("probabilistic_normalize_mu", True)),
             probabilistic_chunk_size=int(descriptor_config.get("probabilistic_chunk_size", 64)),
+            matching_mode=descriptor_config.get("matching_mode"),
         ) if stage == "descriptor" or self.joint_training else None
         self.probabilistic_max_pairs = int(descriptor_config.get("probabilistic_max_pairs", 2048))
         self.warper = warper if stage == "descriptor" or self.joint_training else None
@@ -401,6 +402,8 @@ class RDDLightningModule(pl.LightningModule):
         self.log("train/probabilistic_pairs_after", pairs_after, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/lambda_sigma", float(self.descriptor_loss.sigma_weight), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/probabilistic_normalize_mu", float(self.descriptor_loss.probabilistic_normalize_mu), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train/probabilistic_matching", float(self.descriptor_loss.matching_mode == "probabilistic"), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train/matching_temperature", float(self.descriptor_loss.inv_temp), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/probabilistic_chunk_size", float(self.descriptor_loss.probabilistic_chunk_size), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/probabilistic_max_pairs", float(self.probabilistic_max_pairs), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/logvar_mean", logvar0.mean().detach(), prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
@@ -458,6 +461,8 @@ class RDDLightningModule(pl.LightningModule):
         self.log("train/probabilistic_pairs_after", pairs_after, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/lambda_sigma", float(self.descriptor_loss.sigma_weight), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/probabilistic_normalize_mu", float(self.descriptor_loss.probabilistic_normalize_mu), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train/probabilistic_matching", float(self.descriptor_loss.matching_mode == "probabilistic"), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train/matching_temperature", float(self.descriptor_loss.inv_temp), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/probabilistic_chunk_size", float(self.descriptor_loss.probabilistic_chunk_size), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/probabilistic_max_pairs", float(self.probabilistic_max_pairs), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/logvar_mean", logvar1.mean().detach(), prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
