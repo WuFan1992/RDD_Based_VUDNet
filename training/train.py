@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument('--descriptor_epochs', type=int, default=20, help='Number of descriptor training epochs.')
     parser.add_argument('--detector_epochs', type=int, default=20, help='Number of detector training epochs.')
-    parser.add_argument('--detector_lr_scale', type=float, default=0.1,
+    parser.add_argument('--detector_lr_scale', type=float, default=1.0,
                         help='Scale factor applied to base learning rate during detector-only training.')
     parser.add_argument('--detector_epoch_scale', type=float, default=1.0,
                         help='Scale factor applied to detector_epochs during detector-only training.')
