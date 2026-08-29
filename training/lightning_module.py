@@ -106,7 +106,12 @@ class RDDLightningModule(pl.LightningModule):
             probabilistic_chunk_size=int(descriptor_config.get("probabilistic_chunk_size", 64)),
             matching_mode=descriptor_config.get("matching_mode"),
         ) if stage == "descriptor" or self.joint_training else None
-        self.probabilistic_max_pairs = int(descriptor_config.get("probabilistic_max_pairs", 2048))
+        self.correspondence_max_pairs = int(
+            descriptor_config.get(
+                "correspondence_max_pairs",
+                descriptor_config.get("probabilistic_max_pairs", 2048),
+            )
+        )
         self.warper = warper if stage == "descriptor" or self.joint_training else None
         self.validation_helper: Optional[RDD_helper] = None
         self.n_vals_plot = 32
@@ -191,16 +196,9 @@ class RDDLightningModule(pl.LightningModule):
             if positives is None or len(positives) < 30:
                 continue
             pair_counts_before.append(float(len(positives)))
-            if len(positives) > 10000:
+            if self.correspondence_max_pairs > 0 and len(positives) > self.correspondence_max_pairs:
                 perm = torch.randperm(len(positives), device=positives.device)
-                positives = positives[perm[:10000]]
-            if (
-                self.descriptor_loss.stage >= 2
-                and self.probabilistic_max_pairs > 0
-                and len(positives) > self.probabilistic_max_pairs
-            ):
-                perm = torch.randperm(len(positives), device=positives.device)
-                positives = positives[perm[:self.probabilistic_max_pairs]]
+                positives = positives[perm[:self.correspondence_max_pairs]]
             pair_counts_after.append(float(len(positives)))
 
             pts1 = positives[:, :2].long()
@@ -398,14 +396,14 @@ class RDDLightningModule(pl.LightningModule):
         self.log("train/loss_sigma", sigma_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/loss_sigma_raw", raw_sigma, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/loss_reconstruction", reconstruction_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("train/probabilistic_pairs_before", pairs_before, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("train/probabilistic_pairs_after", pairs_after, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/correspondence_pairs_before", pairs_before, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/correspondence_pairs_after", pairs_after, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/lambda_sigma", float(self.descriptor_loss.sigma_weight), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/probabilistic_normalize_mu", float(self.descriptor_loss.probabilistic_normalize_mu), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/probabilistic_matching", float(self.descriptor_loss.matching_mode == "probabilistic"), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/matching_temperature", float(self.descriptor_loss.inv_temp), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/probabilistic_chunk_size", float(self.descriptor_loss.probabilistic_chunk_size), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
-        self.log("train/probabilistic_max_pairs", float(self.probabilistic_max_pairs), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train/correspondence_max_pairs", float(self.correspondence_max_pairs), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/logvar_mean", logvar0.mean().detach(), prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/logvar_min", logvar0.detach().amin(), prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/logvar_max", logvar0.detach().amax(), prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
@@ -457,14 +455,14 @@ class RDDLightningModule(pl.LightningModule):
         self.log("train/loss_sigma", sigma_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/loss_sigma_raw", raw_sigma, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/loss_reconstruction", reconstruction_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("train/probabilistic_pairs_before", pairs_before, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("train/probabilistic_pairs_after", pairs_after, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/correspondence_pairs_before", pairs_before, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/correspondence_pairs_after", pairs_after, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/lambda_sigma", float(self.descriptor_loss.sigma_weight), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/probabilistic_normalize_mu", float(self.descriptor_loss.probabilistic_normalize_mu), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/probabilistic_matching", float(self.descriptor_loss.matching_mode == "probabilistic"), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/matching_temperature", float(self.descriptor_loss.inv_temp), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/probabilistic_chunk_size", float(self.descriptor_loss.probabilistic_chunk_size), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
-        self.log("train/probabilistic_max_pairs", float(self.probabilistic_max_pairs), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train/correspondence_max_pairs", float(self.correspondence_max_pairs), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/logvar_mean", logvar1.mean().detach(), prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/logvar_min", logvar1.detach().amin(), prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/logvar_max", logvar1.detach().amax(), prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
