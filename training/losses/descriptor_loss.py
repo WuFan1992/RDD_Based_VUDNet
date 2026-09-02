@@ -78,17 +78,26 @@ def probabilistic_dual_softmax_loss(mu1, mu2, logvar1, logvar2, temp=1, normaliz
     row_lse = mu1.new_empty(n)
     diag_logits = mu1.new_empty(n)
     col_lse = mu1.new_full((n,), -torch.inf)
-    
+
+    # Do not build [chunk, n, d] tensors in one shot.  The original formulation
+    # broadcasts the full feature dimension, which creates very large autograd
+    # intermediates and explodes memory as soon as the point count is no longer
+    # capped.  Accumulate the per-feature contribution in smaller blocks instead.
+    feature_block = max(1, min(32, d))
 
     for start in range(0, n, chunk_size):
         end = min(start + chunk_size, n)
         mu1_chunk = mu1[start:end]
         var1_chunk = var1[start:end]
-        
 
-        diff = mu1_chunk[:, None, :] - mu2[None, :, :]
-        variance_sum = var1_chunk[:, None, :] + var2[None, :, :] + 1e-6
-        distance_chunk = (diff.square() / variance_sum).mean(dim=-1)
+        distance_chunk = mu1_chunk.new_zeros(end - start, n)
+        for d_start in range(0, d, feature_block):
+            d_end = min(d_start + feature_block, d)
+            diff = mu1_chunk[:, None, d_start:d_end] - mu2[None, :, d_start:d_end]
+            variance_sum = var1_chunk[:, None, d_start:d_end] + var2[None, :, d_start:d_end] + 1e-6
+            block_term = (diff.square() / variance_sum).sum(dim=-1) / max(1, d_end - d_start)
+            distance_chunk += block_term
+
         logits_chunk = -distance_chunk * temp
 
         row_lse[start:end] = torch.logsumexp(logits_chunk, dim=-1)
