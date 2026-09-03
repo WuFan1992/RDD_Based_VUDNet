@@ -192,6 +192,11 @@ class RDDLightningModule(pl.LightningModule):
         sigma_loss_items = []
         reconstruction_loss_items = []
         raw_sigma_items = []
+        disentanglement_items = []
+        mu_std_items = []
+        variation_std_items = []
+        cosine_similarity_items = []
+        cross_correlation_items = []
         pair_counts_before = []
         pair_counts_after = []
 
@@ -233,12 +238,13 @@ class RDDLightningModule(pl.LightningModule):
                     v1 = variation1[idx].permute(1, 2, 0).reshape(-1, variation1.shape[1])
                 else:
                     v1 = torch.zeros_like(mu1)
-                disentanglement_loss = 0.5 * (
-                    variance_invariance_disentanglement_loss(mu0, v0)
-                    + variance_invariance_disentanglement_loss(mu1, v1)
-                )
-                if rec_loss is not None:
-                    rec_loss = rec_loss + disentanglement_loss * self.descriptor_loss.disentangle_weight
+                dis0, mu_std0, variation_std0, cosine0, cross_corr0 = variance_invariance_disentanglement_loss(mu0, v0)
+                dis1, mu_std1, variation_std1, cosine1, cross_corr1 = variance_invariance_disentanglement_loss(mu1, v1)
+                disentanglement_loss = 0.5 * (dis0 + dis1)
+                mu_std_items.append(0.5 * (mu_std0 + mu_std1))
+                variation_std_items.append(0.5 * (variation_std0 + variation_std1))
+                cosine_similarity_items.append(0.5 * (cosine0 + cosine1))
+                cross_correlation_items.append(0.5 * (cross_corr0 + cross_corr1))
 
             loss_total, loss_h, acc_kp, match_loss, sigma_loss, reconstruction_loss, raw_sigma, loss_dis = self.descriptor_loss(
                 m1, m2, h1, h2, pts1, pts2, lv1, lv2, rec_loss, disentanglement_loss
@@ -248,6 +254,7 @@ class RDDLightningModule(pl.LightningModule):
             sigma_loss_items.append(sigma_loss)
             reconstruction_loss_items.append(reconstruction_loss)
             raw_sigma_items.append(raw_sigma)
+            disentanglement_items.append(loss_dis)
 
             acc_coarse_items.append(check_accuracy(m1, m2))
             acc_kp_items.append(acc_kp)
@@ -257,7 +264,9 @@ class RDDLightningModule(pl.LightningModule):
         if not loss_items:
             zero = (feats0.sum() + feats1.sum() + hmap0.sum() + hmap1.sum()) * 0.0
             zero_scalar = feats0.new_zeros(())
-            return zero, 0.0, 0.0, float(match_counts), zero_scalar, zero_scalar, zero_scalar, zero_scalar, 0.0, 0.0
+            return (zero, 0.0, 0.0, float(match_counts), zero_scalar, zero_scalar,
+                    zero_scalar, zero_scalar, 0.0, 0.0, zero_scalar, zero_scalar,
+                    zero_scalar, zero_scalar, zero_scalar)
 
         loss = torch.stack(loss_items).mean()
         acc_coarse = sum(acc_coarse_items) / len(acc_coarse_items)
@@ -273,6 +282,11 @@ class RDDLightningModule(pl.LightningModule):
             torch.stack(raw_sigma_items).mean(),
             sum(pair_counts_before) / max(1, len(pair_counts_before)),
             sum(pair_counts_after) / max(1, len(pair_counts_after)),
+            torch.stack(disentanglement_items).mean(),
+            torch.stack(mu_std_items).mean() if mu_std_items else feats0.new_zeros(()),
+            torch.stack(variation_std_items).mean() if variation_std_items else feats0.new_zeros(()),
+            torch.stack(cosine_similarity_items).mean() if cosine_similarity_items else feats0.new_zeros(()),
+            torch.stack(cross_correlation_items).mean() if cross_correlation_items else feats0.new_zeros(()),
         )
 
     def _plot_training_matches(self, batch: Dict[str, torch.Tensor], *, use_model_detector: bool) -> None:
@@ -375,7 +389,7 @@ class RDDLightningModule(pl.LightningModule):
             batch["image1"], return_probabilistic=True
         )
 
-        descriptor_loss, acc_coarse, acc_kp, descriptor_matches, match_loss, sigma_loss, reconstruction_loss, raw_sigma, pairs_before, pairs_after = self._compute_descriptor_loss_from_outputs(
+        descriptor_loss, acc_coarse, acc_kp, descriptor_matches, match_loss, sigma_loss, reconstruction_loss, raw_sigma, pairs_before, pairs_after, disentangle_loss, mu_std, variation_std, cosine_similarity, cross_correlation = self._compute_descriptor_loss_from_outputs(
             batch,
             feats0,
             feats1,
@@ -420,6 +434,11 @@ class RDDLightningModule(pl.LightningModule):
         self.log("train/loss_sigma", sigma_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/loss_sigma_raw", raw_sigma, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/loss_reconstruction", reconstruction_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/loss_disentangle", disentangle_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/mu_std", mu_std, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/variation_std", variation_std, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/mu_variation_cosine", cosine_similarity, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/mu_variation_cross_correlation", cross_correlation, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/correspondence_pairs_before", pairs_before, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/correspondence_pairs_after", pairs_after, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/lambda_sigma", float(self.descriptor_loss.sigma_weight), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
@@ -454,7 +473,7 @@ class RDDLightningModule(pl.LightningModule):
         feats2, _, hmap2, logvar2, variation2, reconstruction2, backbone_feature2 = self.model(
             batch["image1"], return_probabilistic=True
         )
-        loss, acc_coarse, acc_kp, match_counts, match_loss, sigma_loss, reconstruction_loss, raw_sigma, pairs_before, pairs_after = self._compute_descriptor_loss_from_outputs(
+        loss, acc_coarse, acc_kp, match_counts, match_loss, sigma_loss, reconstruction_loss, raw_sigma, pairs_before, pairs_after, disentangle_loss, mu_std, variation_std, cosine_similarity, cross_correlation = self._compute_descriptor_loss_from_outputs(
             batch,
             feats1,
             feats2,
@@ -481,6 +500,11 @@ class RDDLightningModule(pl.LightningModule):
         self.log("train/loss_sigma", sigma_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/loss_sigma_raw", raw_sigma, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/loss_reconstruction", reconstruction_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/loss_disentangle", disentangle_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/mu_std", mu_std, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/variation_std", variation_std, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/mu_variation_cosine", cosine_similarity, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/mu_variation_cross_correlation", cross_correlation, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/correspondence_pairs_before", pairs_before, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/correspondence_pairs_after", pairs_after, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/lambda_sigma", float(self.descriptor_loss.sigma_weight), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)

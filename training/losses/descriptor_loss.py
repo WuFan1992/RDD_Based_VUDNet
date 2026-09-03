@@ -35,7 +35,12 @@ def variance_invariance_disentanglement_loss(mu, variation, eps=1e-6):
     branch_balance = (mu_norm.mean() - var_norm.mean()).abs() / (mu_norm.mean() + var_norm.mean() + eps)
     collapse_penalty = (1.0 / (mu_norm.mean() + eps) + 1.0 / (var_norm.mean() + eps)) * 0.5
 
-    return orthogonality + 0.5 * branch_balance + 0.1 * collapse_penalty
+    loss = orthogonality + 0.5 * branch_balance + 0.1 * collapse_penalty
+    mu_std = mu.std(dim=0, unbiased=False).mean()
+    variation_std = variation.std(dim=0, unbiased=False).mean()
+    cosine_similarity = F.cosine_similarity(mu, variation, dim=-1).abs().mean()
+    cross_correlation = corr.abs().mean()
+    return loss, mu_std, variation_std, cosine_similarity, cross_correlation
 
 
 class DescriptorLoss(nn.Module):
