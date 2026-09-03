@@ -16,7 +16,7 @@ from src.RDD import build
 from src.RDD_helper import RDD_helper
 from src.dataset import warper
 from training.losses.detector_loss import DetectorLoss, compute_correspondence
-from training.losses.descriptor_loss import DescriptorLoss
+from training.losses.descriptor_loss import DescriptorLoss, variance_invariance_disentanglement_loss
 from training.utils import check_accuracy, compute_symmetrical_epipolar_errors, aggregate_metrics, compute_pose_errors
 from training.plotting import (
     make_matching_figures,
@@ -102,6 +102,7 @@ class RDDLightningModule(pl.LightningModule):
             stage=int(descriptor_config.get("descriptor_stage", 1)),
             sigma_weight=float(descriptor_config.get("lambda_sigma", 0.01)),
             reconstruction_weight=float(descriptor_config.get("lambda_rec", 1.0)),
+            disentangle_weight=float(descriptor_config.get("lambda_disentangle", 0.5)),
             probabilistic_normalize_mu=bool(descriptor_config.get("probabilistic_normalize_mu", True)),
             probabilistic_chunk_size=int(descriptor_config.get("probabilistic_chunk_size", 64)),
             matching_mode=descriptor_config.get("matching_mode"),
@@ -174,6 +175,8 @@ class RDDLightningModule(pl.LightningModule):
         hmap1: torch.Tensor,
         logvar0: Optional[torch.Tensor] = None,
         logvar1: Optional[torch.Tensor] = None,
+        variation0: Optional[torch.Tensor] = None,
+        variation1: Optional[torch.Tensor] = None,
         reconstruction0: Optional[torch.Tensor] = None,
         reconstruction1: Optional[torch.Tensor] = None,
         backbone_feature0: Optional[torch.Tensor] = None,
@@ -212,16 +215,35 @@ class RDDLightningModule(pl.LightningModule):
             lv1 = logvar0[idx, :, pts1[:, 1], pts1[:, 0]].permute(1, 0) if logvar0 is not None else None
             lv2 = logvar1[idx, :, pts2[:, 1], pts2[:, 0]].permute(1, 0) if logvar1 is not None else None
             rec_loss = None
+            disentanglement_loss = None
             if reconstruction0 is not None and reconstruction1 is not None:
                 rec_loss = 0.5 * (
                     F.mse_loss(reconstruction0[idx], backbone_feature0[idx])
                     + F.mse_loss(reconstruction1[idx], backbone_feature1[idx])
                 )
 
-            loss_ds, loss_h, acc_kp, match_loss, sigma_loss, reconstruction_loss, raw_sigma = self.descriptor_loss(
-                m1, m2, h1, h2, pts1, pts2, lv1, lv2, rec_loss
+            if self.descriptor_loss is not None and self.descriptor_loss.stage >= 4:
+                mu0 = feats0[idx].permute(1, 2, 0).reshape(-1, feats0.shape[1])
+                mu1 = feats1[idx].permute(1, 2, 0).reshape(-1, feats1.shape[1])
+                if variation0 is not None:
+                    v0 = variation0[idx].permute(1, 2, 0).reshape(-1, variation0.shape[1])
+                else:
+                    v0 = torch.zeros_like(mu0)
+                if variation1 is not None:
+                    v1 = variation1[idx].permute(1, 2, 0).reshape(-1, variation1.shape[1])
+                else:
+                    v1 = torch.zeros_like(mu1)
+                disentanglement_loss = 0.5 * (
+                    variance_invariance_disentanglement_loss(mu0, v0)
+                    + variance_invariance_disentanglement_loss(mu1, v1)
+                )
+                if rec_loss is not None:
+                    rec_loss = rec_loss + disentanglement_loss * self.descriptor_loss.disentangle_weight
+
+            loss_total, loss_h, acc_kp, match_loss, sigma_loss, reconstruction_loss, raw_sigma, loss_dis = self.descriptor_loss(
+                m1, m2, h1, h2, pts1, pts2, lv1, lv2, rec_loss, disentanglement_loss
             )
-            loss_items.append(loss_ds + loss_h)
+            loss_items.append(loss_total + loss_h)
             match_loss_items.append(match_loss)
             sigma_loss_items.append(sigma_loss)
             reconstruction_loss_items.append(reconstruction_loss)
@@ -346,10 +368,10 @@ class RDDLightningModule(pl.LightningModule):
         return loss
 
     def _joint_training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
-        feats0, scores_map0, hmap0, logvar0, _, reconstruction0, backbone_feature0 = self.model(
+        feats0, scores_map0, hmap0, logvar0, variation0, reconstruction0, backbone_feature0 = self.model(
             batch["image0"], return_probabilistic=True
         )
-        feats1, scores_map1, hmap1, logvar1, _, reconstruction1, backbone_feature1 = self.model(
+        feats1, scores_map1, hmap1, logvar1, variation1, reconstruction1, backbone_feature1 = self.model(
             batch["image1"], return_probabilistic=True
         )
 
@@ -361,6 +383,8 @@ class RDDLightningModule(pl.LightningModule):
             hmap1,
             logvar0,
             logvar1,
+            variation0,
+            variation1,
             reconstruction0,
             reconstruction1,
             backbone_feature0,
@@ -424,10 +448,10 @@ class RDDLightningModule(pl.LightningModule):
         return loss
 
     def _descriptor_training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
-        feats1, _, hmap1, logvar1, _, reconstruction1, backbone_feature1 = self.model(
+        feats1, _, hmap1, logvar1, variation1, reconstruction1, backbone_feature1 = self.model(
             batch["image0"], return_probabilistic=True
         )
-        feats2, _, hmap2, logvar2, _, reconstruction2, backbone_feature2 = self.model(
+        feats2, _, hmap2, logvar2, variation2, reconstruction2, backbone_feature2 = self.model(
             batch["image1"], return_probabilistic=True
         )
         loss, acc_coarse, acc_kp, match_counts, match_loss, sigma_loss, reconstruction_loss, raw_sigma, pairs_before, pairs_after = self._compute_descriptor_loss_from_outputs(
@@ -438,6 +462,8 @@ class RDDLightningModule(pl.LightningModule):
             hmap2,
             logvar1,
             logvar2,
+            variation1,
+            variation2,
             reconstruction1,
             reconstruction2,
             backbone_feature1,

@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
                         help='Optional YAML config override for the RDD model definition.')
 
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size per GPU.')
-    parser.add_argument('--num_workers', type=int, default=8, help='DataLoader worker count.')
+    parser.add_argument('--num_workers', type=int, default=0, help='DataLoader worker count.')
     parser.add_argument('--training_res', type=int, default=800, help='Training resolution (short side).')
     parser.add_argument('--no-crop', dest='no_crop', action='store_true',
                         help='Build training datasets with resize-only samples instead of crop plus resize samples.')
@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument('--descriptor_epochs', type=int, default=20, help='Number of descriptor training epochs.')
     parser.add_argument('--detector_epochs', type=int, default=20, help='Number of detector training epochs.')
-    parser.add_argument('--detector_lr_scale', type=float, default=0.1,
+    parser.add_argument('--detector_lr_scale', type=float, default=1.0,
                         help='Scale factor applied to base learning rate during detector-only training.')
     parser.add_argument('--detector_epoch_scale', type=float, default=1.0,
                         help='Scale factor applied to detector_epochs during detector-only training.')
@@ -128,7 +128,7 @@ def prepare_trainer_kwargs(args: argparse.Namespace) -> dict:
         "precision": args.precision,
         "gradient_clip_val": 1.0,
         "log_every_n_steps": 50,
-        "reload_dataloaders_every_n_epochs": 1,
+        "reload_dataloaders_every_n_epochs": 0,
     }
     if args.strategy == 'ddp':
         kwargs["strategy"] = DDPStrategy(find_unused_parameters=True)

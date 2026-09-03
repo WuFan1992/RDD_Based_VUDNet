@@ -4,9 +4,44 @@ import torch.nn.functional as F
 from training.utils import *
 from torch import nn
 
+def variance_invariance_disentanglement_loss(mu, variation, eps=1e-6):
+    """Keep invariance and variation branches complementary instead of letting one branch absorb everything.
+
+    The idea is to:
+      1) minimize covariance between the two branch embeddings,
+      2) keep both branches active (no branch collapse),
+      3) prevent the network from transferring all information into a single branch.
+    """
+    if mu.dim() != 2 or variation.dim() != 2:
+        raise RuntimeError('mu and variation must be 2D matrices [N, C]')
+    if mu.size() != variation.size():
+        raise RuntimeError('mu and variation shapes must match')
+
+    mu = F.normalize(mu, dim=-1)
+    variation = F.normalize(variation, dim=-1)
+
+    mu_centered = mu - mu.mean(dim=0, keepdim=True)
+    var_centered = variation - variation.mean(dim=0, keepdim=True)
+
+    cov = (mu_centered.T @ var_centered) / max(1, mu.shape[0] - 1)
+    scale_mu = mu_centered.norm(dim=0, keepdim=True).clamp_min(eps)
+    scale_var = var_centered.norm(dim=0, keepdim=True).clamp_min(eps)
+    corr = cov / (scale_mu * scale_var + eps)
+
+    orthogonality = corr.abs().mean()
+
+    mu_norm = mu_centered.pow(2).mean(dim=-1).sqrt().clamp_min(eps)
+    var_norm = var_centered.pow(2).mean(dim=-1).sqrt().clamp_min(eps)
+    branch_balance = (mu_norm.mean() - var_norm.mean()).abs() / (mu_norm.mean() + var_norm.mean() + eps)
+    collapse_penalty = (1.0 / (mu_norm.mean() + eps) + 1.0 / (var_norm.mean() + eps)) * 0.5
+
+    return orthogonality + 0.5 * branch_balance + 0.1 * collapse_penalty
+
+
 class DescriptorLoss(nn.Module):
     def __init__(self, inv_temp=20, dual_softmax_weight=5, heatmap_weight=1,
                  stage=1, sigma_weight=0.0, reconstruction_weight=0.0,
+                 disentangle_weight=0.5,
                  probabilistic_normalize_mu=True,
                  probabilistic_chunk_size=64,
                  matching_mode=None):
@@ -17,6 +52,7 @@ class DescriptorLoss(nn.Module):
         self.stage = stage
         self.sigma_weight = sigma_weight
         self.reconstruction_weight = reconstruction_weight
+        self.disentangle_weight = float(disentangle_weight)
         self.probabilistic_normalize_mu = probabilistic_normalize_mu
         self.probabilistic_chunk_size = max(1, int(probabilistic_chunk_size))
         self.matching_mode = matching_mode or ("probabilistic" if stage >= 2 else "cosine")
@@ -24,7 +60,7 @@ class DescriptorLoss(nn.Module):
             raise ValueError("matching_mode must be 'cosine' or 'probabilistic'")
     
     def forward(self, m1, m2, h1, h2, pts1, pts2, logvar1=None, logvar2=None,
-                reconstruction_loss=None):
+                reconstruction_loss=None, disentanglement_loss=None):
         if self.matching_mode == "probabilistic":
             loss_ds = probabilistic_dual_softmax_loss(
                 m1,
@@ -49,12 +85,17 @@ class DescriptorLoss(nn.Module):
         if self.stage >= 2:
             raw_sigma = 0.5 * (variance_regularization(logvar1) + variance_regularization(logvar2))
             loss_sigma = raw_sigma * self.sigma_weight
+
         loss_rec = torch.zeros_like(loss_ds)
         if self.stage >= 4 and reconstruction_loss is not None:
             loss_rec = reconstruction_loss * self.reconstruction_weight
 
-        total_loss = loss_ds + loss_sigma + loss_rec
-        return total_loss, loss_h, acc_kp, loss_ds, loss_sigma, loss_rec, raw_sigma
+        loss_dis = torch.zeros_like(loss_ds)
+        if self.stage >= 4 and disentanglement_loss is not None:
+            loss_dis = disentanglement_loss * self.disentangle_weight
+
+        total_loss = loss_ds + loss_sigma + loss_rec + loss_dis
+        return total_loss, loss_h, acc_kp, loss_ds, loss_sigma, loss_rec, raw_sigma, loss_dis
 
 
 def variance_regularization(logvar):
