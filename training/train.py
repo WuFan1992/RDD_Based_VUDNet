@@ -129,6 +129,10 @@ def prepare_trainer_kwargs(args: argparse.Namespace) -> dict:
         "gradient_clip_val": 1.0,
         "log_every_n_steps": 50,
         "reload_dataloaders_every_n_epochs": 0,
+        # Some CUDA kernels used by the position encoding, notably cumsum,
+        # have no deterministic implementation on this PyTorch/CUDA build.
+        # "warn" preserves reproducible RNG setup without aborting training.
+        "deterministic": "warn",
     }
     if args.strategy == 'ddp':
         kwargs["strategy"] = DDPStrategy(find_unused_parameters=True)
@@ -190,6 +194,9 @@ def main() -> None:
     CANONICAL_BS = 32 # canonical batch size for lr scaling
 
     pl.seed_everything(args.seed, workers=True)
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     model_config = resolve_model_config(args)
     joint_training = model_config.get('detector', {}).get('joint_training', False)
     if joint_training:

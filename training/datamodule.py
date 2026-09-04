@@ -290,6 +290,8 @@ class CombinedDataModule(pl.LightningDataModule):
         self._ensure_train_dataset()
         assert self.train_dataset is not None, "setup() must be called before requesting dataloaders."
         worker_init_fn = partial(_seed_worker, base_seed=self.seed)
+        generator = torch.Generator()
+        generator.manual_seed(self.seed)
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
@@ -298,12 +300,15 @@ class CombinedDataModule(pl.LightningDataModule):
             pin_memory=True,
             persistent_workers=self.num_workers > 0,
             worker_init_fn=worker_init_fn,
+            generator=generator,
         )
 
     def val_dataloader(self) -> Optional[DataLoader]:
         if self.val_dataset is None:
             return []
         worker_init_fn = partial(_seed_worker, base_seed=self.seed)
+        generator = torch.Generator()
+        generator.manual_seed(self.seed)
         loader = DataLoader(
             self.val_dataset,
             batch_size=1,
@@ -311,5 +316,6 @@ class CombinedDataModule(pl.LightningDataModule):
             num_workers=min(self.num_workers, 4),
             pin_memory=True,
             worker_init_fn=worker_init_fn,
+            generator=generator,
         )
         return loader
