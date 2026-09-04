@@ -96,7 +96,18 @@ class RDDLightningModule(pl.LightningModule):
         self.best_auc10 = 0.0
         self._skip_first_epoch_benchmark = True
         self.detector_loss = DetectorLoss(temperature=0.1, scores_th=0.1) if stage == "detector" else None
-        self.descriptor_loss = DescriptorLoss(inv_temp=20) if stage == "descriptor" or self.joint_training else None
+        descriptor_config = model_config.get("descriptor", {})
+        self.descriptor_loss = DescriptorLoss(
+            inv_temp=20,
+            lambda_orphan=descriptor_config.get("lambda_orphan", 0.1),
+            margin=descriptor_config.get("orphan_margin", 0.1),
+            beta=descriptor_config.get("orphan_beta", 20.0),
+            num_candidate_patches=descriptor_config.get("num_candidate_patches", 8),
+            num_hard_patches=descriptor_config.get("num_hard_patches", 2),
+            patch_size=descriptor_config.get("patch_size", 8.0),
+            min_patch_points=descriptor_config.get("min_patch_points", 10),
+            margin_confusion=descriptor_config.get("margin_confusion", 0.1),
+        ) if stage == "descriptor" or self.joint_training else None
         self.warper = warper if stage == "descriptor" or self.joint_training else None
         self.validation_helper: Optional[RDD_helper] = None
         self.n_vals_plot = 32
@@ -181,8 +192,15 @@ class RDDLightningModule(pl.LightningModule):
             m1 = feats0[idx, :, pts1[:, 1], pts1[:, 0]].permute(1, 0)
             m2 = feats1[idx, :, pts2[:, 1], pts2[:, 0]].permute(1, 0)
 
-            loss_ds, loss_h, acc_kp = self.descriptor_loss(m1, m2, h1, h2, pts1, pts2)
+            loss_ds, loss_h, acc_kp, orphan_metrics = self.descriptor_loss(
+                m1, m2, h1, h2, pts1, pts2, return_metrics=True
+            )
             loss_items.append(loss_ds + loss_h)
+            for metric_name, metric_value in orphan_metrics.items():
+                self.log(
+                    f"train/{metric_name}", metric_value, prog_bar=False,
+                    on_step=True, on_epoch=True, sync_dist=True, batch_size=1
+                )
 
             acc_coarse_items.append(check_accuracy(m1, m2))
             acc_kp_items.append(acc_kp)
