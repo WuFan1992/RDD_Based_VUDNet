@@ -140,13 +140,17 @@ class DescriptorLoss(nn.Module):
         normalized_m2 = F.normalize(m2, dim=-1)
         similarity = (normalized_m1 @ normalized_m2.t()) * self.inv_temp
         loss_ds = dual_softmax_loss_from_similarity(similarity) * self.dual_softmax_weight
-        candidate_patches = generate_candidate_patches(
-            pts2, self.num_candidate_patches, self.patch_size, self.min_patch_points
-        )
-        orphan_loss, confusion, max_confusion, mean_positive, mean_orphan, ratio = compute_hard_patch_orphan_loss(
-            similarity, candidate_patches, self.num_hard_patches, self.margin_confusion,
-            self.margin, self.beta, return_metrics=True
-        )
+        if self.lambda_orphan > 0:
+            candidate_patches = generate_candidate_patches(
+                pts2, self.num_candidate_patches, self.patch_size, self.min_patch_points
+            )
+            orphan_loss, confusion, max_confusion, mean_positive, mean_orphan, ratio = compute_hard_patch_orphan_loss(
+                similarity, candidate_patches, self.num_hard_patches, self.margin_confusion,
+                self.margin, self.beta, return_metrics=True
+            )
+        else:
+            orphan_loss = similarity.sum() * 0.0
+            confusion = max_confusion = mean_positive = mean_orphan = ratio = similarity.new_zeros(())
                     
         loss_h1, acc1 = heatmap_loss(h1, pts1)
         loss_h2, acc2 = heatmap_loss(h2, pts2)

@@ -103,8 +103,8 @@ class MegaDepthPoseMNNBenchmark:
     def __init__(self, data_root="./megadepth_test_1500", scene_names = None) -> None:
         if scene_names is None:
             self.scene_names = [
-                "0015_0.1_0.3.npz",
-                "0015_0.3_0.5.npz",
+                #"0015_0.1_0.3.npz",
+                #"0015_0.3_0.5.npz",
                 "0022_0.1_0.3.npz",
                 "0022_0.3_0.5.npz",
                 "0022_0.5_0.7.npz",

@@ -99,7 +99,7 @@ class RDDLightningModule(pl.LightningModule):
         descriptor_config = model_config.get("descriptor", {})
         self.descriptor_loss = DescriptorLoss(
             inv_temp=20,
-            lambda_orphan=descriptor_config.get("lambda_orphan", 0.1),
+            lambda_orphan=descriptor_config.get("lambda_orphan", 0.0),
             margin=descriptor_config.get("orphan_margin", 0.1),
             beta=descriptor_config.get("orphan_beta", 20.0),
             num_candidate_patches=descriptor_config.get("num_candidate_patches", 8),

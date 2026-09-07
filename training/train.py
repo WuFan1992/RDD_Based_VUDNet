@@ -74,7 +74,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--descriptor_epochs', type=int, default=20, help='Number of descriptor training epochs.')
     parser.add_argument('--detector_epochs', type=int, default=20, help='Number of detector training epochs.')
 
-    parser.add_argument('--seed', type=int, default=0, help='Random seed.')
+    parser.add_argument('--seed', type=int, default=0,
+                        help='Single experiment seed used by Lightning, datasets, workers, and DataLoaders.')
     parser.add_argument('--accelerator', type=str, default='auto', help='Lightning accelerator (e.g. auto, gpu).')
     parser.add_argument('--devices', type=str, default='auto', help='Devices to use (e.g. auto, 1, 0,1).')
     parser.add_argument('--strategy', type=str, default=None, help='Lightning strategy (e.g. ddp).')
