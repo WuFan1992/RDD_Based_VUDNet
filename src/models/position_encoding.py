@@ -3,6 +3,21 @@ import torch
 from torch import nn
 from ..utils.misc import NestedTensor
 
+
+def _deterministic_cumulative_sum(mask, dim):
+    """Cumulative sum for boolean masks without CUDA's nondeterministic kernel."""
+    result = torch.zeros(mask.shape, dtype=torch.float32, device=mask.device)
+    length = mask.shape[dim]
+    previous = None
+    for index in range(length):
+        current = mask.select(dim, index).to(torch.float32)
+        if previous is not None:
+            current = current + previous
+        result.select(dim, index).copy_(current)
+        previous = current
+    return result
+
+
 class PositionEmbeddingSine(nn.Module):
     """
     This is a more standard version of the position embedding, very similar to the one
@@ -25,8 +40,8 @@ class PositionEmbeddingSine(nn.Module):
         if mask is None:
             mask = torch.zeros_like(x[:, 0, :, :], dtype=torch.bool)
         not_mask = ~mask
-        y_embed = not_mask.cumsum(1, dtype=torch.float32)
-        x_embed = not_mask.cumsum(2, dtype=torch.float32)
+        y_embed = _deterministic_cumulative_sum(not_mask, dim=1)
+        x_embed = _deterministic_cumulative_sum(not_mask, dim=2)
         if self.normalize:
             eps = 1e-6
             y_embed = (y_embed - 0.5) / (y_embed[:, -1:, :] + eps) * self.scale

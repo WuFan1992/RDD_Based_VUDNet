@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import os
 from copy import deepcopy
 from pathlib import Path
 from typing import Optional
+
+# Must be set before CUDA is initialized for deterministic cuBLAS operations.
+os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+
 import pytorch_lightning as pl
 import torch
 from pytorch_lightning.callbacks import ModelCheckpoint
@@ -129,10 +134,7 @@ def prepare_trainer_kwargs(args: argparse.Namespace) -> dict:
         "gradient_clip_val": 1.0,
         "log_every_n_steps": 50,
         "reload_dataloaders_every_n_epochs": 0,
-        # Some CUDA kernels used by the position encoding, notably cumsum,
-        # have no deterministic implementation on this PyTorch/CUDA build.
-        # "warn" preserves reproducible RNG setup without aborting training.
-        "deterministic": "warn",
+        "deterministic": True,
     }
     if args.strategy == 'ddp':
         kwargs["strategy"] = DDPStrategy(find_unused_parameters=True)
@@ -194,9 +196,12 @@ def main() -> None:
     CANONICAL_BS = 32 # canonical batch size for lr scaling
 
     pl.seed_everything(args.seed, workers=True)
-    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.use_deterministic_algorithms(True)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision('highest')
     model_config = resolve_model_config(args)
     joint_training = model_config.get('detector', {}).get('joint_training', False)
     if joint_training:

@@ -666,7 +666,11 @@ class RDDLightningModule(pl.LightningModule):
 
         for thr in [5, 10, 20]:
             # log on all ranks for ModelCheckpoint callback to work properly
-            self.log(f'auc@{thr}', torch.tensor(np.mean(multi_val_metrics[f'auc@{thr}'])))  # ckpt monitors on this
+            self.log(
+                f'auc@{thr}',
+                torch.tensor(np.mean(multi_val_metrics[f'auc@{thr}'])),
+                batch_size=1,
+            )  # ckpt monitors on this
 
         self.validation_step_outputs.clear()
         # Clear GPU cache and force garbage collection after validation
