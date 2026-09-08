@@ -95,35 +95,38 @@ def central_match(pair_info):
 
 
 @torch.inference_mode()
-def extract_mu(model, image, device):
+def extract_descriptor_features(model, image, device):
     tensor, rh, rw = model.preprocess_tensor(image)
     tensor = tensor.to(device).float()
-    mu = model.forward(tensor, return_probabilistic=True)[0]
+    outputs = model.forward(tensor, return_probabilistic=True)
+    mu = outputs[0]
+    final_feature = outputs[-1]
     height, width = tensor.shape[-2:]
-    return mu, height, width, rh, rw
+    return mu, final_feature, height, width, rh, rw
 
 
-def sample_mu(model, mu, points, height, width, rh, rw):
-    device = mu.device
-    points = torch.as_tensor(points, device=device, dtype=mu.dtype)[None]
+def sample_features(model, features, points, height, width, rh, rw):
+    device = features.device
+    points = torch.as_tensor(points, device=device, dtype=features.dtype)[None]
     points = points / points.new_tensor([rw, rh])
-    return F.normalize(model.interpolator(mu, points, H=height, W=width)[0], dim=-1)
+    return F.normalize(model.interpolator(features, points, H=height, W=width)[0], dim=-1)
 
 
-def feature_grid(model, mu, height, width):
-    _, _, feature_height, feature_width = mu.shape
+def feature_grid(model, features, height, width):
+    _, _, feature_height, feature_width = features.shape
     stride_y = height / feature_height
     stride_x = width / feature_width
-    ys = (torch.arange(feature_height, device=mu.device, dtype=mu.dtype) + 0.5) * stride_y
-    xs = (torch.arange(feature_width, device=mu.device, dtype=mu.dtype) + 0.5) * stride_x
+    ys = (torch.arange(feature_height, device=features.device, dtype=features.dtype) + 0.5) * stride_y
+    xs = (torch.arange(feature_width, device=features.device, dtype=features.dtype) + 0.5) * stride_x
     grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
     points = torch.stack((grid_x.flatten(), grid_y.flatten()), dim=-1)[None]
-    return F.normalize(model.interpolator(mu, points, H=height, W=width)[0], dim=-1), points[0]
+    descriptors = model.interpolator(features, points, H=height, W=width)[0]
+    return F.normalize(descriptors, dim=-1), points[0]
 
 
 def hard_negative_similarity(queries, candidates, positive_points, candidate_points, rh, rw, exclusion_radius):
     similarities = []
-    exclusion = candidate_points.new_tensor([rw, rh]) * exclusion_radius
+    exclusion = candidate_points.new_tensor([1.0 / rw, 1.0 / rh]) * exclusion_radius
     chunk_size = 256
     for start in range(0, len(queries), chunk_size):
         query = queries[start:start + chunk_size]
@@ -138,23 +141,29 @@ def hard_negative_similarity(queries, candidates, positive_points, candidate_poi
 
 
 def evaluate_pair(model, image0, image1, points0, points1, device, exclusion_radius):
-    mu0, h0, w0, rh0, rw0 = extract_mu(model, image0, device)
-    mu1, h1, w1, rh1, rw1 = extract_mu(model, image1, device)
-    descriptors0 = sample_mu(model, mu0, points0, h0, w0, rh0, rw0)
-    descriptors1 = sample_mu(model, mu1, points1, h1, w1, rh1, rw1)
-    positive = (descriptors0 * descriptors1).sum(dim=-1)
-    candidates, candidate_points = feature_grid(model, mu1, h1, w1)
-    hard_negative = hard_negative_similarity(
-        descriptors0, candidates, points1, candidate_points, rh1, rw1, exclusion_radius
-    )
-    return positive.cpu().numpy(), hard_negative.cpu().numpy()
+    mu0, final0, h0, w0, rh0, rw0 = extract_descriptor_features(model, image0, device)
+    mu1, final1, h1, w1, rh1, rw1 = extract_descriptor_features(model, image1, device)
+    results = {}
+    for name, features0, features1 in (("mu", mu0, mu1), ("final_feature", final0, final1)):
+        descriptors0 = sample_features(model, features0, points0, h0, w0, rh0, rw0)
+        descriptors1 = sample_features(model, features1, points1, h1, w1, rh1, rw1)
+        positive = (descriptors0 * descriptors1).sum(dim=-1)
+        candidates, candidate_points = feature_grid(model, features1, h1, w1)
+        hard_negative = hard_negative_similarity(
+            descriptors0, candidates, points1, candidate_points, rh1, rw1, exclusion_radius
+        )
+        results[name] = positive.cpu().numpy(), hard_negative.cpu().numpy()
+    return results
 
 
 def evaluate_model(weights, config, data_root, scenes, device, max_positive_points, exclusion_radius):
     model = build(config=config, weights=weights)
     model.to(device)
     model.eval()
-    positive_values, negative_values = [], []
+    values = {
+        "mu": {"positive": [], "hard_negative": []},
+        "final_feature": {"positive": [], "hard_negative": []},
+    }
     pair_stats = []
     full_depth_pairs = 0
     central_fallback_pairs = 0
@@ -194,30 +203,61 @@ def evaluate_model(weights, config, data_root, scenes, device, max_positive_poin
                 indices = np.linspace(0, len(points0) - 1, max_positive_points, dtype=np.int64)
                 points0, points1 = points0[indices], points1[indices]
 
-            positive, hard_negative = evaluate_pair(
+            pair_results = evaluate_pair(
                 model, image0, image1, points0, points1, device, exclusion_radius
             )
-            positive_values.append(positive)
-            negative_values.append(hard_negative)
-            pair_stats.append({
+            pair_stat = {
                 "scene": scene_name,
                 "pair_index": pair_index,
-                "num_points": int(len(positive)),
-                "positive_mean": float(positive.mean()),
-                "hard_negative_mean": float(hard_negative.mean()),
-                "margin_mean": float((positive - hard_negative).mean()),
-            })
+                "num_points": int(len(next(iter(pair_results.values()))[0])),
+            }
+            for name, (positive, hard_negative) in pair_results.items():
+                values[name]["positive"].append(positive)
+                values[name]["hard_negative"].append(hard_negative)
+                margin = positive - hard_negative
+                pair_stat[name] = {
+                    "positive_mean": float(positive.mean()),
+                    "hard_negative_mean": float(hard_negative.mean()),
+                    "margin_mean": float(margin.mean()),
+                    "margin_median": float(np.median(margin)),
+                    "positive_above_hard_negative": float((margin > 0).mean()),
+                }
+            pair_stats.append(pair_stat)
 
-    positives = np.concatenate(positive_values) if positive_values else np.empty(0)
-    negatives = np.concatenate(negative_values) if negative_values else np.empty(0)
+    metrics = {}
+    for name, branch_values in values.items():
+        positives = np.concatenate(branch_values["positive"]) if branch_values["positive"] else np.empty(0)
+        negatives = np.concatenate(branch_values["hard_negative"]) if branch_values["hard_negative"] else np.empty(0)
+        margins = positives - negatives
+        metrics[name] = {
+            "num_positive_points": int(len(positives)),
+            "positive_mean": float(positives.mean()) if len(positives) else None,
+            "hard_negative_mean": float(negatives.mean()) if len(negatives) else None,
+            "margin_mean": float(margins.mean()) if len(margins) else None,
+            "margin_median": float(np.median(margins)) if len(margins) else None,
+            "margin_std": float(margins.std()) if len(margins) else None,
+            "margin_p10": float(np.percentile(margins, 10)) if len(margins) else None,
+            "margin_p90": float(np.percentile(margins, 90)) if len(margins) else None,
+            "positive_above_hard_negative": float((margins > 0).mean()) if len(margins) else None,
+            "positive_below_hard_negative": float((positives <= negatives).mean()) if len(positives) else None,
+        }
+    comparison = {}
+    if metrics["mu"]["margin_mean"] is not None and metrics["final_feature"]["margin_mean"] is not None:
+        comparison = {
+            "mu_margin_mean_minus_final_feature": (
+                metrics["mu"]["margin_mean"] - metrics["final_feature"]["margin_mean"]
+            ),
+            "mu_margin_better": metrics["mu"]["margin_mean"] > metrics["final_feature"]["margin_mean"],
+            "mu_positive_above_hard_negative_minus_final_feature": (
+                metrics["mu"]["positive_above_hard_negative"]
+                - metrics["final_feature"]["positive_above_hard_negative"]
+            ),
+        }
     return {
         "weights": str(weights),
         "num_pairs": len(pair_stats),
-        "num_positive_points": int(len(positives)),
-        "positive_mean": float(positives.mean()) if len(positives) else None,
-        "hard_negative_mean": float(negatives.mean()) if len(negatives) else None,
-        "margin_mean": float((positives - negatives).mean()) if len(positives) else None,
-        "positive_below_hard_negative": float((positives <= negatives).mean()) if len(positives) else None,
+        "metrics": metrics,
+        "comparison": comparison,
         "full_depth_pairs": full_depth_pairs,
         "central_fallback_pairs": central_fallback_pairs,
         "pairs": pair_stats,
@@ -226,10 +266,8 @@ def evaluate_model(weights, config, data_root, scenes, device, max_positive_poin
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--weights-a", required=True, help="First RDD checkpoint.")
-    parser.add_argument("--weights-b", required=True, help="Second RDD checkpoint.")
-    parser.add_argument("--config-a", default=None, help="Optional config for checkpoint A.")
-    parser.add_argument("--config-b", default=None, help="Optional config for checkpoint B.")
+    parser.add_argument("--weights", required=True, help="RDD checkpoint to evaluate.")
+    parser.add_argument("--config", default=None, help="Optional model config.")
     parser.add_argument("--data-root", default="./datasets/megadepth_test_1500")
     parser.add_argument("--output", default="./outputs/mega_1500/sim_positive_negative.json")
     parser.add_argument("--max-positive-points", type=int, default=4096, help="Per pair cap; use 0 for all recovered points.")
@@ -241,11 +279,16 @@ def parse_arguments():
 if __name__ == "__main__":
     args = parse_arguments()
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    results = {
-        "model_a": evaluate_model(args.weights_a, args.config_a, args.data_root, SCENES, device, args.max_positive_points, args.exclusion_radius),
-        "model_b": evaluate_model(args.weights_b, args.config_b, args.data_root, SCENES, device, args.max_positive_points, args.exclusion_radius),
-    }
+    results = evaluate_model(
+        args.weights,
+        args.config,
+        args.data_root,
+        SCENES,
+        device,
+        args.max_positive_points,
+        args.exclusion_radius,
+    )
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as file:
         json.dump(results, file, indent=2)
-    print(json.dumps({key: {metric: value for metric, value in result.items() if metric != "pairs"} for key, result in results.items()}, indent=2))
+    print(json.dumps({key: value for key, value in results.items() if key != "pairs"}, indent=2))
