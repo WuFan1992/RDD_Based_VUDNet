@@ -77,7 +77,7 @@ def compute_orphan_loss(similarity, removed_indices, margin, beta):
 
 def compute_hard_patch_orphan_loss(
     similarity, candidate_patches, num_hard_patches, margin_confusion, margin, beta,
-    return_metrics=False,
+    return_metrics=False, return_details=False,
 ):
     hard_patches = select_hard_patches(
         similarity.detach(), candidate_patches, num_hard_patches, margin_confusion, beta
@@ -85,6 +85,14 @@ def compute_hard_patch_orphan_loss(
     if not hard_patches:
         zero = similarity.sum() * 0.0
         result = zero, similarity.new_zeros(()), similarity.new_zeros(()), similarity.new_zeros(()), similarity.new_zeros(()), similarity.new_zeros(())
+        details = {
+            'active_orphan_fraction': similarity.new_zeros(()),
+            'mean_positive_minus_orphan': similarity.new_zeros(()),
+            'valid_patch_count': similarity.new_tensor(float(len(candidate_patches))),
+            'hard_patch_count': similarity.new_zeros(()),
+        }
+        if return_details:
+            return result + (details,)
         return result if return_metrics else zero
 
     losses = [compute_orphan_loss(similarity, patch, margin, beta) for patch in hard_patches]
@@ -92,6 +100,14 @@ def compute_hard_patch_orphan_loss(
     if not valid_losses:
         zero = similarity.sum() * 0.0
         result = zero, similarity.new_zeros(()), similarity.new_zeros(()), similarity.new_zeros(()), similarity.new_zeros(()), similarity.new_zeros(())
+        details = {
+            'active_orphan_fraction': similarity.new_zeros(()),
+            'mean_positive_minus_orphan': similarity.new_zeros(()),
+            'valid_patch_count': similarity.new_tensor(float(len(candidate_patches))),
+            'hard_patch_count': similarity.new_tensor(float(len(hard_patches))),
+        }
+        if return_details:
+            return result + (details,)
         return result if return_metrics else zero
     orphan_loss = torch.stack(valid_losses).mean()
     scores = torch.stack([
@@ -99,6 +115,8 @@ def compute_hard_patch_orphan_loss(
         for patch in hard_patches
     ])
     metric_values = []
+    active_values = []
+    gap_values = []
     detached_similarity = similarity.detach()
     for patch in hard_patches:
         removed, remaining = _remaining_indices(detached_similarity, patch)
@@ -106,12 +124,22 @@ def compute_hard_patch_orphan_loss(
             positive = detached_similarity[remaining, remaining]
             orphan = torch.logsumexp(beta * detached_similarity[removed][:, remaining], dim=0) / beta
             metric_values.append((positive.mean(), orphan.mean(), (orphan > positive).float().mean()))
+            active_values.append((margin + orphan - positive > 0).float().mean())
+            gap_values.append((positive - orphan).mean())
     if metric_values:
         metric_tensor = torch.stack([torch.stack(values) for values in metric_values])
         mean_positive, mean_orphan, ratio = metric_tensor.mean(dim=0)
     else:
         mean_positive = mean_orphan = ratio = similarity.new_zeros(())
     result = orphan_loss, scores.mean(), scores.max(), mean_positive, mean_orphan, ratio
+    details = {
+        'active_orphan_fraction': torch.stack(active_values).mean() if active_values else similarity.new_zeros(()),
+        'mean_positive_minus_orphan': torch.stack(gap_values).mean() if gap_values else similarity.new_zeros(()),
+        'valid_patch_count': similarity.new_tensor(float(len(candidate_patches))),
+        'hard_patch_count': similarity.new_tensor(float(len(hard_patches))),
+    }
+    if return_details:
+        return result + (details,)
     return result if return_metrics else orphan_loss
 
 
@@ -140,17 +168,38 @@ class DescriptorLoss(nn.Module):
         normalized_m2 = F.normalize(m2, dim=-1)
         similarity = (normalized_m1 @ normalized_m2.t()) * self.inv_temp
         loss_ds = dual_softmax_loss_from_similarity(similarity) * self.dual_softmax_weight
+        dual_gradient_norm = similarity.new_zeros(())
+        if torch.is_grad_enabled() and similarity.requires_grad:
+            dual_gradient = torch.autograd.grad(
+                loss_ds, similarity, retain_graph=True, allow_unused=True
+            )[0]
+            if dual_gradient is not None:
+                dual_gradient_norm = dual_gradient.detach().norm()
         if self.lambda_orphan > 0:
             candidate_patches = generate_candidate_patches(
                 pts2, self.num_candidate_patches, self.patch_size, self.min_patch_points
             )
-            orphan_loss, confusion, max_confusion, mean_positive, mean_orphan, ratio = compute_hard_patch_orphan_loss(
+            orphan_loss, confusion, max_confusion, mean_positive, mean_orphan, ratio, orphan_details = compute_hard_patch_orphan_loss(
                 similarity, candidate_patches, self.num_hard_patches, self.margin_confusion,
-                self.margin, self.beta, return_metrics=True
+                self.margin, self.beta, return_metrics=True, return_details=True
             )
+            orphan_gradient_norm = similarity.new_zeros(())
+            if torch.is_grad_enabled() and similarity.requires_grad and orphan_loss.requires_grad:
+                orphan_gradient = torch.autograd.grad(
+                    orphan_loss, similarity, retain_graph=True, allow_unused=True
+                )[0]
+                if orphan_gradient is not None:
+                    orphan_gradient_norm = orphan_gradient.detach().norm()
         else:
             orphan_loss = similarity.sum() * 0.0
             confusion = max_confusion = mean_positive = mean_orphan = ratio = similarity.new_zeros(())
+            orphan_gradient_norm = similarity.new_zeros(())
+            orphan_details = {
+                'active_orphan_fraction': similarity.new_zeros(()),
+                'mean_positive_minus_orphan': similarity.new_zeros(()),
+                'valid_patch_count': similarity.new_zeros(()),
+                'hard_patch_count': similarity.new_zeros(()),
+            }
                     
         loss_h1, acc1 = heatmap_loss(h1, pts1)
         loss_h2, acc2 = heatmap_loss(h2, pts2)
@@ -167,6 +216,12 @@ class DescriptorLoss(nn.Module):
             'mean_positive_similarity': mean_positive.detach(),
             'mean_orphan_similarity': mean_orphan.detach(),
             'orphan_competition_ratio': ratio.detach(),
+            'active_orphan_fraction': orphan_details['active_orphan_fraction'].detach(),
+            'mean_positive_minus_orphan': orphan_details['mean_positive_minus_orphan'].detach(),
+            'valid_patch_count': orphan_details['valid_patch_count'].detach(),
+            'hard_patch_count': orphan_details['hard_patch_count'].detach(),
+            'orphan_similarity_grad_norm': orphan_gradient_norm.detach(),
+            'dual_similarity_grad_norm': dual_gradient_norm.detach(),
         }
         if return_metrics:
             return loss_ds + self.lambda_orphan * orphan_loss, loss_h, acc_kp, metrics
