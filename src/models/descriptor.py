@@ -38,6 +38,15 @@ class RDD_Descriptor(nn.Module):
 										nn.Sigmoid()
 									)
 
+        # Logit (rather than probability) of geometry-conditioned descriptor
+        # stability.  It is trained only as a calibrated auxiliary score; it
+        # never suppresses descriptor gradients for difficult correspondences.
+        stability_hidden_dim = max(self.hidden_dim // 2, 64)
+        self.stability_head = nn.Sequential(
+            BasicLayer(self.hidden_dim, stability_hidden_dim, 1, padding=0),
+            nn.Conv2d(stability_hidden_dim, 1, 1),
+        )
+
         if num_feature_levels > 1:
             num_backbone_outs = len(backbone.strides)
             input_proj_list = []
@@ -119,6 +128,10 @@ class RDD_Descriptor(nn.Module):
         matchibility = self.matchibility_head(final_feature)
         
         return final_feature, matchibility
+
+    def stability_logits(self, descriptor_features):
+        """Predict per-pixel stability logits from the descriptor feature map."""
+        return self.stability_head(descriptor_features)
     
     
 def build_descriptor(config):

@@ -1,0 +1,9 @@
+RDD:
+  DESCRIPTOR:
+    # Start conservatively: this augments, rather than replaces, dual-softmax
+    # and hard-patch orphan supervision from the default configuration.
+    STABILITY_LOSS_WEIGHT: 0.05
+    STABILITY_SCORE_WEIGHT: 0.02
+    STABILITY_BASE_TOLERANCE: 0.05
+    STABILITY_GEOMETRY_TOLERANCE: 0.20
+    STABILITY_TAIL_FRACTION: 0.25

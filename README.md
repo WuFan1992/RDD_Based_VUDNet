@@ -182,6 +182,20 @@ python -m training.train
 # You can train the RDD CVPR version with
 python -m training.train --config ./configs/cvpr.yaml --no-crop
 ```
+
+For geometry-conditioned descriptor stability training, use:
+
+```bash
+python -m training.train --config ./configs/stability.yaml
+```
+
+This adds a per-correspondence stability objective to dual-softmax and the
+hard-patch orphan loss. It uses depth, intrinsics, and relative pose to derive
+local viewing-ray, depth-scale, and depth-edge difficulty; it does not use a
+single global pose-distance target. The new TensorBoard metrics are
+`mean_descriptor_drift`, `mean_stability_tolerance`, and
+`geometry_stable_fraction`. All stability weights are zero in the default and
+CVPR configurations, preserving the original training objective.
 and then the detector
 ```bash
 python -m training.train --detector_from /path/to/descriptor.pth --train_detector --training_res 480

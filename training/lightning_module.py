@@ -16,7 +16,7 @@ from src.RDD import build
 from src.RDD_helper import RDD_helper
 from src.dataset import warper
 from training.losses.detector_loss import DetectorLoss, compute_correspondence
-from training.losses.descriptor_loss import DescriptorLoss
+from training.losses.descriptor_loss import DescriptorLoss, compute_geometry_difficulty
 from training.utils import check_accuracy, compute_symmetrical_epipolar_errors, aggregate_metrics, compute_pose_errors
 from training.plotting import (
     make_matching_figures,
@@ -107,6 +107,11 @@ class RDDLightningModule(pl.LightningModule):
             patch_size=descriptor_config.get("patch_size", 8.0),
             min_patch_points=descriptor_config.get("min_patch_points", 10),
             margin_confusion=descriptor_config.get("margin_confusion", 0.1),
+            stability_loss_weight=descriptor_config.get("stability_loss_weight", 0.0),
+            stability_score_weight=descriptor_config.get("stability_score_weight", 0.0),
+            stability_base_tolerance=descriptor_config.get("stability_base_tolerance", 0.05),
+            stability_geometry_tolerance=descriptor_config.get("stability_geometry_tolerance", 0.20),
+            stability_tail_fraction=descriptor_config.get("stability_tail_fraction", 0.25),
         ) if stage == "descriptor" or self.joint_training else None
         self.warper = warper if stage == "descriptor" or self.joint_training else None
         self.validation_helper: Optional[RDD_helper] = None
@@ -170,6 +175,12 @@ class RDDLightningModule(pl.LightningModule):
         hmap1: torch.Tensor,
     ) -> tuple[torch.Tensor, float, float, float]:
         positives_md_coarse = self.warper.spvs_coarse(batch, getattr(self.model, "stride", 4))
+        stability_enabled = (
+            self.descriptor_loss.stability_loss_weight > 0
+            or self.descriptor_loss.stability_score_weight > 0
+        )
+        stability_map0 = self.model.descriptor.stability_logits(feats0) if stability_enabled else None
+        stability_map1 = self.model.descriptor.stability_logits(feats1) if stability_enabled else None
 
         loss_items = []
         acc_coarse_items: List[float] = []
@@ -192,8 +203,22 @@ class RDDLightningModule(pl.LightningModule):
             m1 = feats0[idx, :, pts1[:, 1], pts1[:, 0]].permute(1, 0)
             m2 = feats1[idx, :, pts2[:, 1], pts2[:, 0]].permute(1, 0)
 
+            if stability_enabled:
+                geometry_difficulty = compute_geometry_difficulty(
+                    pts1, pts2,
+                    {key: value[idx] for key, value in batch['warp01_params'].items()},
+                    stride=getattr(self.model, "stride", 4),
+                )
+                stability_logits1 = stability_map0[idx, 0, pts1[:, 1], pts1[:, 0]]
+                stability_logits2 = stability_map1[idx, 0, pts2[:, 1], pts2[:, 0]]
+            else:
+                geometry_difficulty = stability_logits1 = stability_logits2 = None
+
             loss_ds, loss_h, acc_kp, orphan_metrics = self.descriptor_loss(
-                m1, m2, h1, h2, pts1, pts2, return_metrics=True
+                m1, m2, h1, h2, pts1, pts2, return_metrics=True,
+                geometry_difficulty=geometry_difficulty,
+                stability_logits1=stability_logits1,
+                stability_logits2=stability_logits2,
             )
             loss_items.append(loss_ds + loss_h)
             for metric_name, metric_value in orphan_metrics.items():
