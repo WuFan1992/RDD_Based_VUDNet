@@ -76,6 +76,8 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument('--seed', type=int, default=0,
                         help='Single experiment seed used by Lightning, datasets, workers, and DataLoaders.')
+    parser.add_argument('--deterministic', action='store_true',
+                        help='Request deterministic PyTorch/Lightning kernels for reproducibility checks.')
     parser.add_argument('--accelerator', type=str, default='auto', help='Lightning accelerator (e.g. auto, gpu).')
     parser.add_argument('--devices', type=str, default='auto', help='Devices to use (e.g. auto, 1, 0,1).')
     parser.add_argument('--strategy', type=str, default=None, help='Lightning strategy (e.g. ddp).')
@@ -127,6 +129,7 @@ def prepare_trainer_kwargs(args: argparse.Namespace) -> dict:
         "gradient_clip_val": 1.0,
         "log_every_n_steps": 50,
         "reload_dataloaders_every_n_epochs": 1,
+        "deterministic": args.deterministic,
     }
     if args.strategy == 'ddp':
         kwargs["strategy"] = DDPStrategy(find_unused_parameters=True)
@@ -188,6 +191,11 @@ def main() -> None:
     CANONICAL_BS = 32 # canonical batch size for lr scaling
 
     pl.seed_everything(args.seed, workers=True)
+    if args.deterministic:
+        # Keep cuDNN from selecting run-dependent convolution algorithms.  This is
+        # optional because it can make training slower on some GPUs.
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
     model_config = resolve_model_config(args)
     joint_training = model_config.get('detector', {}).get('joint_training', False)
     if joint_training:

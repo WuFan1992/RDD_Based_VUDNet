@@ -97,7 +97,10 @@ def compute_geometry_stability_loss(
     drift = 1.0 - (descriptors0 * descriptors1).sum(dim=-1).clamp(-1.0, 1.0)
     difficulty = geometry_difficulty.detach().to(drift).clamp_min(0.0)
     tolerance = (float(base_tolerance) + float(geometry_tolerance) * difficulty).clamp(max=1.5)  # 不同的geometry_difficulty对应不同的容忍度
-    excess = F.relu(drift - tolerance) / tolerance.clamp_min(1e-4)  # 超过容忍度的相对程度
+    # Penalise absolute drift beyond the geometry-conditioned allowance.
+    # Dividing by tolerance would make a small allowance (e.g. 0.05) amplify
+    # gradients by 20x and let easy-geometry samples dominate training.
+    excess = F.relu(drift - tolerance)
     bin_edges = drift.new_tensor([0.15, 0.35, 0.70])
     bins = torch.bucketize(difficulty, bin_edges)
     hard_indices = []
