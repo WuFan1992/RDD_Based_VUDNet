@@ -1,5 +1,6 @@
 import sys
 sys.path.append(".")
+import random
 import numpy as np
 import torch
 from PIL import Image
@@ -12,6 +13,19 @@ from src.RDD import build
 from src.RDD_helper import RDD_helper
 import os
 from benchmarks.utils import pose_auc, angle_error_vec, angle_error_mat, symmetric_epipolar_distance, compute_symmetrical_epipolar_errors, compute_pose_error, compute_relative_pose, estimate_pose, dynamic_alpha
+
+
+def seed_everything(seed: int) -> None:
+    """Seed all random sources used by this standalone evaluation script."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    # OpenCV's RANSAC also consumes its own random-number generator.
+    cv2.setRNGSeed(int(seed) % (2**31 - 1))
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
 
 def make_matching_figure(
         img0, img1, mkpts0, mkpts1, color,
@@ -236,11 +250,15 @@ def parse_arguments():
     parser.add_argument("--pose_estimator", type=str, default="opencv", choices=["opencv", "poselib"], help="Pose estimator backend.")
 
     parser.add_argument("--config", type=str, default=None, help="Path to the config file for the model")
+
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Seed for OpenCV RANSAC and all evaluation random sources.")
     
     return parser.parse_args()
 
 if __name__ == "__main__":
     args = parse_arguments()    
+    seed_everything(args.seed)
     if not os.path.exists('outputs'):
         os.makedirs('outputs')
     

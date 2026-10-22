@@ -30,11 +30,14 @@ _CN.RDD.DESCRIPTOR.MIN_PATCH_POINTS = 10
 _CN.RDD.DESCRIPTOR.MARGIN_CONFUSION = 0.5
 # Geometry-conditioned stability is opt-in.  The default objective remains
 # dual-softmax plus the existing hard-patch orphan term.
-_CN.RDD.DESCRIPTOR.STABILITY_LOSS_WEIGHT = 0.2
-_CN.RDD.DESCRIPTOR.STABILITY_SCORE_WEIGHT = 0.25
+_CN.RDD.DESCRIPTOR.STABILITY_LOSS_WEIGHT = 0.05
+_CN.RDD.DESCRIPTOR.STABILITY_SCORE_WEIGHT = 0.0
 _CN.RDD.DESCRIPTOR.STABILITY_BASE_TOLERANCE = 0.05
 _CN.RDD.DESCRIPTOR.STABILITY_GEOMETRY_TOLERANCE = 0.20
 _CN.RDD.DESCRIPTOR.STABILITY_TAIL_FRACTION = 0.25
+# Number of descriptor-training epochs used to linearly ramp the stability
+# loss. Zero keeps the configured stability weight active from epoch 0.
+_CN.RDD.DESCRIPTOR.STABILITY_WARMUP_EPOCHS = 5
 _CN.RDD.DESCRIPTOR.PRETRAIN_BACKBONE = True
 
 # 2. detector

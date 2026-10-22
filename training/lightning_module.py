@@ -113,6 +113,9 @@ class RDDLightningModule(pl.LightningModule):
             stability_geometry_tolerance=descriptor_config.get("stability_geometry_tolerance", 0.20),
             stability_tail_fraction=descriptor_config.get("stability_tail_fraction", 0.25),
         ) if stage == "descriptor" or self.joint_training else None
+        self.stability_warmup_epochs = int(descriptor_config.get("stability_warmup_epochs", 0))
+        if self.stability_warmup_epochs < 0:
+            raise ValueError("stability_warmup_epochs must be non-negative")
         self.warper = warper if stage == "descriptor" or self.joint_training else None
         self.validation_helper: Optional[RDD_helper] = None
         self.n_vals_plot = 32
@@ -159,6 +162,19 @@ class RDDLightningModule(pl.LightningModule):
         optimizer.zero_grad()
 
     # Training ----------------------------------------------------------------------
+    def _current_stability_loss_weight(self) -> float:
+        """Linearly ramp the stability loss from zero to its configured weight.
+
+        With ``STABILITY_WARMUP_EPOCHS = N``, epoch 0 has no stability-loss
+        gradient and epoch N onward uses the full configured weight.  A value
+        of zero disables the ramp and preserves the previous behavior.
+        """
+        target_weight = float(self.descriptor_loss.stability_loss_weight)
+        if target_weight <= 0.0 or self.stability_warmup_epochs == 0:
+            return target_weight
+        progress = min(1.0, max(0.0, float(self.current_epoch) / self.stability_warmup_epochs))
+        return target_weight * progress
+
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
         if self.joint_training:
             return self._joint_training_step(batch, batch_idx)
@@ -175,8 +191,9 @@ class RDDLightningModule(pl.LightningModule):
         hmap1: torch.Tensor,
     ) -> tuple[torch.Tensor, float, float, float]:
         positives_md_coarse = self.warper.spvs_coarse(batch, getattr(self.model, "stride", 4))
+        effective_stability_loss_weight = self._current_stability_loss_weight()
         stability_enabled = (
-            self.descriptor_loss.stability_loss_weight > 0
+            effective_stability_loss_weight > 0
             or self.descriptor_loss.stability_score_weight > 0
         )
         stability_map0 = self.model.descriptor.stability_logits(feats0) if stability_enabled else None
@@ -219,6 +236,7 @@ class RDDLightningModule(pl.LightningModule):
                 geometry_difficulty=geometry_difficulty,
                 stability_logits1=stability_logits1,
                 stability_logits2=stability_logits2,
+                stability_loss_weight=effective_stability_loss_weight,
             )
             loss_items.append(loss_ds + loss_h)
             for metric_name, metric_value in orphan_metrics.items():
@@ -237,6 +255,10 @@ class RDDLightningModule(pl.LightningModule):
             return zero, 0.0, 0.0, float(match_counts)
 
         loss = torch.stack(loss_items).mean()
+        self.log(
+            "train/stability_loss_weight", effective_stability_loss_weight,
+            prog_bar=False, on_step=False, on_epoch=True, sync_dist=True, batch_size=1,
+        )
         acc_coarse = sum(acc_coarse_items) / len(acc_coarse_items)
         acc_kp = sum(acc_kp_items) / len(acc_kp_items)
         return loss, acc_coarse, acc_kp, float(match_counts)
